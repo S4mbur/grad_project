@@ -45,6 +45,9 @@ env/
 
 # Large data files - not for GitHub
 data/tiles/
+data/tiles_4class/
+data/tiles_multiclass/
+data/trial_multiclass/
 data/raw_wsi/
 data/gdc/
 data/tmp/
@@ -52,6 +55,14 @@ data/heatmaps/
 data/gradcam_demo/
 data/debug/
 data/reports/
+data/downloads/
+
+# MIL pipeline outputs
+data/mil_demo/
+data/mil_results/
+data/mil_slide_manifest.csv
+
+results/
 
 # Temporary manifest files (keep only essential ones)
 data/manifests/*predictions*.csv
@@ -67,9 +78,10 @@ data/debug/
 *.tiff
 *.ndpi
 
-# Model checkpoints (large files)
+# Model checkpoints and training logs (large files)
 logs/checkpoints/
 logs/runs/
+logs/demo_training/
 logs/*.pt
 *.pt
 
@@ -100,3 +112,13 @@ graduation_project_interim_template.tex
 
 # Reference PDFs
 *.pdf
+
+*.sln
+
+reports/
+
+*.pt
+
+app/
+app_desktop/
+app_dotnet/
