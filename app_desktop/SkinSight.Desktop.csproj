@@ -1,0 +1,45 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>SkinSight</RootNamespace>
+    <AssemblyName>SkinSight</AssemblyName>
+
+    <!-- Application metadata -->
+    <Product>SkinSight Desktop</Product>
+    <Description>AI-Powered Whole Slide Image Analysis for Skin Cancer Detection</Description>
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Edge WebView2 (uses installed Edge, no Chromium bundled) -->
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.2903.40" />
+
+    <!-- In-process web server -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+
+    <!-- Image processing -->
+    <PackageReference Include="SixLabors.ImageSharp" Version="3.1.7" />
+    <PackageReference Include="SixLabors.ImageSharp.Drawing" Version="2.1.5" />
+
+    <!-- ML inference via ONNX Runtime -->
+    <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.17.3" />
+  </ItemGroup>
+
+  <!-- Copy wwwroot (HTML/CSS/JS) to output directory -->
+  <ItemGroup>
+    <None Include="wwwroot\**" CopyToOutputDirectory="PreserveNewest" LinkBase="wwwroot" />
+  </ItemGroup>
+
+  <!-- Copy OpenSlide Windows DLLs to output if they exist -->
+  <ItemGroup>
+    <None Include="openslide\*.dll" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="openslide\*.exe" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

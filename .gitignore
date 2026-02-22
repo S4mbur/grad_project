@@ -119,6 +119,15 @@ reports/
 
 *.pt
 
-app/
-app_desktop/
-app_dotnet/
+# App runtime/upload data (not source code)
+app/uploads/
+app/results/
+app/dzi_tiles/
+
+# .NET build outputs
+app_desktop/bin/
+app_desktop/obj/
+app_dotnet/bin/
+app_dotnet/obj/
+app_dotnet/uploads/
+app_dotnet/results/

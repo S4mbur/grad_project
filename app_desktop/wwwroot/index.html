@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description"
+        content="SkinSight – AI-powered whole slide image analysis for skin cancer detection with multi-model selection. Upload WSIs and get instant 4-class predictions with attention heatmaps.">
+    <title>SkinSight – AI Skin Cancer WSI Analysis</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/openseadragon/4.1.1/openseadragon.min.js"></script>
+</head>
+
+<body>
+
+    <div class="app" id="app">
+
+        <!-- ═══════════════════════ HEADER ═══════════════════════ -->
+        <header class="header">
+            <div class="header-brand">
+                <div class="header-logo">🔬</div>
+                <div>
+                    <div class="header-title">SkinSight</div>
+                    <div class="header-subtitle">AI-Powered WSI Analysis · 4-Class</div>
+                </div>
+            </div>
+            <div class="header-actions">
+                <button class="btn btn-ghost btn-sm" id="btn-export" onclick="exportResults()"
+                    title="Export current results" style="display:none;">
+                    📥 Export
+                </button>
+            </div>
+        </header>
+
+        <!-- ═══════════════════════ MAIN ═══════════════════════ -->
+        <div class="main-content">
+
+            <!-- ──────── Sidebar ──────── -->
+            <aside class="sidebar" id="sidebar">
+
+                <!-- Upload Section -->
+                <div class="sidebar-section">
+                    <div class="section-title"><span class="icon">📤</span> Upload Slide</div>
+                    <div class="upload-zone" id="upload-zone" onclick="document.getElementById('file-input').click()">
+                        <div class="upload-icon">🧫</div>
+                        <div class="upload-text-main">Drop WSI file here</div>
+                        <div class="upload-text-sub">or click to browse</div>
+                        <div class="upload-formats">
+                            <span class="format-tag">.tif</span>
+                            <span class="format-tag">.svs</span>
+                            <span class="format-tag">.ndpi</span>
+                            <span class="format-tag">.mrxs</span>
+                        </div>
+                    </div>
+                    <input type="file" id="file-input" accept=".tif,.tiff,.svs,.ndpi,.mrxs,.scn" style="display:none"
+                        onchange="handleFileSelect(event)">
+                </div>
+
+                <!-- Model Selection -->
+                <div class="sidebar-section">
+                    <div class="section-title"><span class="icon">🧠</span> Model Selection</div>
+                    <div class="model-selector" id="model-selector">
+                        <select id="model-select" class="model-select">
+                            <option value="phikon">Loading models...</option>
+                        </select>
+                        <div class="model-info" id="model-info">
+                            <span class="model-f1" id="model-f1"></span>
+                            <span class="model-desc" id="model-desc"></span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Analysis Status -->
+                <div class="sidebar-section analysis-status" id="analysis-status">
+                    <div class="section-title"><span class="icon">⚡</span> Analysis</div>
+                    <div class="progress-container">
+                        <div class="progress-header">
+                            <span class="progress-label" id="progress-filename">Processing...</span>
+                            <span class="progress-percent" id="progress-percent">0%</span>
+                        </div>
+                        <div class="progress-bar-track">
+                            <div class="progress-bar-fill" id="progress-bar" style="width: 0%"></div>
+                        </div>
+                        <div class="progress-message">
+                            <div class="spinner"></div>
+                            <span id="progress-message">Starting analysis...</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Results -->
+                <div class="sidebar-section result-panel" id="result-panel">
+                    <div class="section-title"><span class="icon">🎯</span> Prediction</div>
+
+                    <!-- Model badge -->
+                    <div class="model-badge" id="result-model-badge" style="display:none;">
+                        <span class="badge-icon">🧠</span>
+                        <span class="badge-text" id="result-model-name"></span>
+                    </div>
+
+                    <!-- Prediction Card -->
+                    <div class="prediction-card" id="prediction-card">
+                        <div class="prediction-label-small">Diagnosis</div>
+                        <div class="prediction-value" id="prediction-value">—</div>
+                        <div class="prediction-confidence" id="prediction-confidence"></div>
+                    </div>
+
+                    <!-- Probability Bars (4 classes) -->
+                    <div class="prob-bars" id="prob-bars">
+                        <div class="prob-row">
+                            <span class="prob-label">Normal/Benign</span>
+                            <div class="prob-bar-track">
+                                <div class="prob-bar-fill normal" id="prob-bar-normal" style="width: 0%"></div>
+                            </div>
+                            <span class="prob-value" id="prob-val-normal">0%</span>
+                        </div>
+                        <div class="prob-row">
+                            <span class="prob-label">BCC</span>
+                            <div class="prob-bar-track">
+                                <div class="prob-bar-fill bcc" id="prob-bar-bcc" style="width: 0%"></div>
+                            </div>
+                            <span class="prob-value" id="prob-val-bcc">0%</span>
+                        </div>
+                        <div class="prob-row">
+                            <span class="prob-label">SCC</span>
+                            <div class="prob-bar-track">
+                                <div class="prob-bar-fill scc" id="prob-bar-scc" style="width: 0%"></div>
+                            </div>
+                            <span class="prob-value" id="prob-val-scc">0%</span>
+                        </div>
+                        <div class="prob-row">
+                            <span class="prob-label">Melanoma</span>
+                            <div class="prob-bar-track">
+                                <div class="prob-bar-fill melanoma" id="prob-bar-melanoma" style="width: 0%"></div>
+                            </div>
+                            <span class="prob-value" id="prob-val-melanoma">0%</span>
+                        </div>
+                    </div>
+
+                    <!-- Ensemble Details (shown only for ensemble) -->
+                    <div class="ensemble-details" id="ensemble-details" style="display:none;">
+                        <div class="section-title" style="margin-top:6px;"><span class="icon">🔀</span> Ensemble
+                            Breakdown</div>
+                        <div id="ensemble-breakdown"></div>
+                    </div>
+
+                    <!-- Slide Info -->
+                    <div class="info-stats" id="info-stats">
+                        <div class="stat-card">
+                            <div class="stat-value" id="stat-tiles">—</div>
+                            <div class="stat-label">Tiles Analyzed</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-value" id="stat-time">—</div>
+                            <div class="stat-label">Analysis Time</div>
+                        </div>
+                    </div>
+
+                    <!-- Heatmap Toggle -->
+                    <div class="toggle-group" id="heatmap-toggle-group">
+                        <div class="toggle-label-text">
+                            <span>🔥</span> Attention Heatmap
+                        </div>
+                        <label class="toggle-switch">
+                            <input type="checkbox" id="heatmap-toggle" onchange="toggleHeatmap(this.checked)">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+
+                    <!-- Top Attention Tiles -->
+                    <div class="section-title" style="margin-top: 8px;"><span class="icon">🏆</span> Top Attention Tiles
+                    </div>
+                    <div class="top-tiles-grid" id="top-tiles-grid">
+                        <!-- Filled dynamically -->
+                    </div>
+                </div>
+
+                <!-- History -->
+                <div class="sidebar-section">
+                    <div class="section-title"><span class="icon">📋</span> History</div>
+                    <div class="history-list" id="history-list">
+                        <div class="empty-state">
+                            <div class="icon">📂</div>
+                            <p>No analyses yet.<br>Upload a slide to get started.</p>
+                        </div>
+                    </div>
+                </div>
+
+            </aside>
+
+            <!-- ──────── Viewer ──────── -->
+            <div class="viewer-area" id="viewer-area">
+
+                <!-- Placeholder -->
+                <div class="viewer-placeholder" id="viewer-placeholder">
+                    <div class="viewer-placeholder-icon">🔬</div>
+                    <h2>Ready to Analyze</h2>
+                    <p>Upload a whole slide image to begin analysis.<br>The AI will extract tiles, run the selected
+                        model, and generate<br>attention-based heatmaps showing diagnostic regions.</p>
+                    <div class="class-legend">
+                        <span class="legend-item normal">Normal/Benign</span>
+                        <span class="legend-item bcc">BCC</span>
+                        <span class="legend-item scc">SCC</span>
+                        <span class="legend-item melanoma">Melanoma</span>
+                    </div>
+                </div>
+
+                <!-- OpenSeadragon Viewer Container -->
+                <div id="slide-viewer"></div>
+
+                <!-- Slide Info Bar (top-left overlay) -->
+                <div class="slide-info-bar" id="slide-info-bar">
+                    <div class="slide-info-item">
+                        <span class="label">Size:</span>
+                        <span class="value" id="info-dimensions">—</span>
+                    </div>
+                    <div class="slide-info-item">
+                        <span class="label">MPP:</span>
+                        <span class="value" id="info-mpp">—</span>
+                    </div>
+                    <div class="slide-info-item">
+                        <span class="label">Model:</span>
+                        <span class="value" id="info-model">—</span>
+                    </div>
+                </div>
+
+                <!-- Viewer Controls (bottom center) -->
+                <div class="viewer-controls" id="viewer-controls">
+                    <button class="viewer-btn" onclick="zoomIn()" title="Zoom In">🔍+</button>
+                    <button class="viewer-btn" onclick="zoomOut()" title="Zoom Out">🔍−</button>
+                    <div class="viewer-divider"></div>
+                    <button class="viewer-btn" onclick="resetView()" title="Fit to Screen">🔲</button>
+                    <div class="viewer-divider"></div>
+                    <button class="viewer-btn" id="btn-heatmap-viewer" onclick="toggleHeatmapFromViewer()"
+                        title="Toggle Heatmap">🔥</button>
+                </div>
+            </div>
+
+        </div><!-- /.main-content -->
+
+    </div><!-- /.app -->
+
+    <!-- Toast Container -->
+    <div class="toast-container" id="toast-container"></div>
+
+    <!-- Tile Preview Modal -->
+    <div class="modal-backdrop" id="tile-modal" onclick="closeTileModal(event)">
+        <div class="modal-content" onclick="event.stopPropagation()">
+            <div class="modal-header">
+                <div class="modal-title" id="modal-tile-title">Tile Preview</div>
+                <button class="modal-close" onclick="closeTileModal()">&times;</button>
+            </div>
+            <img class="modal-tile-image" id="modal-tile-image" src="" alt="Tile preview">
+            <div class="modal-tile-info" id="modal-tile-info"></div>
+            <button class="btn btn-navigate" id="modal-nav-btn" style="display:none;"
+                title="Navigate to this tile on the slide viewer">
+                📍 View on Slide
+            </button>
+        </div>
+    </div>
+
+    <script src="/app.js"></script>
+</body>
+
+</html>
