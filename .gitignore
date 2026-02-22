@@ -131,3 +131,5 @@ app_dotnet/bin/
 app_dotnet/obj/
 app_dotnet/uploads/
 app_dotnet/results/
+
+*hf_login.py
