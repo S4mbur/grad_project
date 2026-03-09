@@ -22,7 +22,7 @@ MANIFEST_DIR = DATA_DIR / "manifests"
 GDC_FILES_ENDPOINT = "https://api.gdc.cancer.gov/files"
 GDC_DATA_ENDPOINT = "https://api.gdc.cancer.gov/data"
 
-MAX_TOTAL_GB = 20
+MAX_TOTAL_GB = 151  # Was 20. Now ~100GB more for melanoma slides
 
 
 def get_all_skcm_slides():

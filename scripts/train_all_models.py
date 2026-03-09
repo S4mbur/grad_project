@@ -1,23 +1,11 @@
 #!/usr/bin/env python3
 """
-=============================================================================
-  Multi-Model 4-Class Skin Cancer MIL Pipeline
-  
-  Trains Gated Attention MIL with EVERY available feature extractor:
-    1. ResNet18      (512-d)   ← already done, re-uses cached features
+    1. ResNet18      (512-d)
     2. ResNet50      (2048-d)
     3. ConvNeXt-Small (768-d)
     4. ConvNeXt-Base  (1024-d)
     5. DINOv2-base   (768-d)
     6. Phikon        (768-d)
-  
-  Tiles are shared (cached from first run).
-  Each model gets its own feature dir and results dir.
-  A final comparison table is printed at the end.
-  
-  This is MIL (Multiple Instance Learning), NOT tile-based classification.
-  Each WSI = bag of tile features → attention-weighted aggregation → slide label.
-=============================================================================
 """
 import os
 import sys

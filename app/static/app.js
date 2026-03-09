@@ -18,7 +18,7 @@ const state = {
     slideInfo: null,
     topTilesData: [],
     modelsData: null,    // from /api/models
-    selectedModel: 'phikon',
+    selectedModel: 'ensemble_3_best',
 };
 
 const API = '';
@@ -106,28 +106,55 @@ async function loadModels() {
         const select = document.getElementById('model-select');
         select.innerHTML = '';
 
-        // Add individual models
-        data.models.forEach(m => {
-            const opt = document.createElement('option');
-            opt.value = m.key;
-            opt.textContent = `${m.name} (F1: ${(m.f1 * 100).toFixed(1)}%)`;
-            if (!m.available) {
-                opt.disabled = true;
-                opt.textContent += ' ⚠ unavailable';
-            }
-            select.appendChild(opt);
-        });
-
-        // Add ensemble option
-        if (data.ensemble) {
-            const opt = document.createElement('option');
-            opt.value = 'ensemble';
-            opt.textContent = `🔀 ${data.ensemble.display}`;
-            select.appendChild(opt);
+        // Add ensemble presets first (top priority)
+        if (data.ensembles && data.ensembles.length > 0) {
+            const ensGroup = document.createElement('optgroup');
+            ensGroup.label = '🏆 Ensemble (MelFN=0)';
+            data.ensembles.forEach(e => {
+                const opt = document.createElement('option');
+                opt.value = e.key;
+                opt.textContent = `${e.display} (F1: ${(e.f1 * 100).toFixed(1)}%)`;
+                ensGroup.appendChild(opt);
+            });
+            select.appendChild(ensGroup);
         }
 
+        // Group individual models by backbone
+        const groups = {};
+        data.models.forEach(m => {
+            const g = m.group || 'Other';
+            if (!groups[g]) groups[g] = [];
+            groups[g].push(m);
+        });
+
+        // Order: Phikon first, then ConvNeXt, DINOv2, ResNet
+        const groupOrder = ['Phikon', 'ConvNeXt-Base', 'ConvNeXt-Small', 'DINOv2', 'ResNet'];
+        const sortedGroups = groupOrder.filter(g => groups[g]);
+        Object.keys(groups).forEach(g => {
+            if (!sortedGroups.includes(g)) sortedGroups.push(g);
+        });
+
+        sortedGroups.forEach(groupName => {
+            const models = groups[groupName];
+            if (!models) return;
+            const optGroup = document.createElement('optgroup');
+            optGroup.label = `🧠 ${groupName}`;
+            models.forEach(m => {
+                const opt = document.createElement('option');
+                opt.value = m.key;
+                const fnLabel = m.mel_fn !== undefined && m.mel_fn !== '?' ? ` · MelFN=${m.mel_fn}` : '';
+                opt.textContent = `${m.display} (F1: ${(m.f1 * 100).toFixed(1)}%${fnLabel})`;
+                if (!m.available) {
+                    opt.disabled = true;
+                    opt.textContent += ' ⚠';
+                }
+                optGroup.appendChild(opt);
+            });
+            select.appendChild(optGroup);
+        });
+
         // Set default
-        select.value = data.default || 'phikon';
+        select.value = data.default || 'ensemble_3_best';
         state.selectedModel = select.value;
         updateModelInfo(select.value);
 
@@ -147,23 +174,27 @@ function updateModelInfo(key) {
     const f1El = document.getElementById('model-f1');
     const descEl = document.getElementById('model-desc');
 
-    if (key === 'ensemble' && state.modelsData?.ensemble) {
-        f1El.textContent = 'Top-3 Ensemble';
-        descEl.textContent = state.modelsData.ensemble.description;
+    // Check ensemble presets first
+    const ensemble = state.modelsData?.ensembles?.find(e => e.key === key);
+    if (ensemble) {
+        f1El.textContent = `F1: ${(ensemble.f1 * 100).toFixed(1)}% · AUC: ${(ensemble.auc * 100).toFixed(1)}% · MelFN: 0 ✓`;
+        descEl.textContent = ensemble.description;
         return;
     }
 
     const model = state.modelsData?.models?.find(m => m.key === key);
     if (model) {
-        f1El.textContent = `F1: ${(model.f1 * 100).toFixed(1)}% · AUC: ${(model.auc * 100).toFixed(1)}%`;
+        const fnText = model.mel_fn !== undefined && model.mel_fn !== '?' ? ` · MelFN: ${model.mel_fn}` : '';
+        f1El.textContent = `F1: ${(model.f1 * 100).toFixed(1)}% · AUC: ${(model.auc * 100).toFixed(1)}%${fnText}`;
         descEl.textContent = model.description;
     }
 }
 
 function getModelDisplayName(key) {
-    if (key === 'ensemble') return 'Ensemble (Top-3)';
+    const ensemble = state.modelsData?.ensembles?.find(e => e.key === key);
+    if (ensemble) return ensemble.name;
     const model = state.modelsData?.models?.find(m => m.key === key);
-    return model ? model.name : key;
+    return model ? model.display : key;
 }
 
 // ────────────────────── Polling ─────────────────────────

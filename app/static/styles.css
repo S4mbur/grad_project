@@ -186,7 +186,8 @@ body {
     border-right: 1px solid var(--border-subtle);
     display: flex;
     flex-direction: column;
-    overflow: hidden;
+    overflow-y: auto;
+    overflow-x: hidden;
     flex-shrink: 0;
     transition: transform var(--transition-slow);
 }
@@ -194,12 +195,11 @@ body {
 .sidebar-section {
     border-bottom: 1px solid var(--border-subtle);
     padding: 16px;
+    flex-shrink: 0;
 }
 
 .sidebar-section:last-child {
     border-bottom: none;
-    flex: 1;
-    overflow-y: auto;
 }
 
 .section-title {

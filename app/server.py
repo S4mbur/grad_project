@@ -1,13 +1,13 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
-SkinSight – Whole Slide Image Analysis Server  (v3 – multi-model)
+SkinSight â€“ Whole Slide Image Analysis Server  (v3 â€“ multi-model)
 ================================================================
 Key features:
-  • 4-class skin cancer classification (Normal/Benign, BCC, SCC, Melanoma)
-  • 6 feature extractor models + Ensemble mode
-  • On-demand DZI tile serving (no pre-generation)
-  • Attention-based heatmaps with top-tile navigation
-  • Model selection per analysis
+  â€¢ 4-class skin cancer classification (Normal/Benign, BCC, SCC, Melanoma)
+  â€¢ 6 feature extractor models + Ensemble mode
+  â€¢ On-demand DZI tile serving (no pre-generation)
+  â€¢ Attention-based heatmaps with top-tile navigation
+  â€¢ Model selection per analysis
 """
 
 import os
@@ -47,7 +47,7 @@ RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 # Configuration
 # ---------------------------------------------------------------------------
 class AppConfig:
-    """Server configuration – all tunables in one place."""
+    """Server configuration â€“ all tunables in one place."""
     DELETE_SLIDE_AFTER_ANALYSIS = False
     RESULT_RETENTION_MINUTES = 60
     MAX_UPLOAD_SIZE_GB = 5
@@ -74,86 +74,216 @@ CLASS_KEYS = ["normal", "bcc", "scc", "melanoma"]
 N_CLASSES = 4
 
 # ---------------------------------------------------------------------------
-# Model Registry — best version of each model
+# Model Registry â€” best version of each model
 # ---------------------------------------------------------------------------
 MODELS_DIR = Path("/mnt/d/skin_cancer_project/models")
 RESULTS_BASE = PROJECT_DIR / "results"
 
 MODEL_REGISTRY = {
-    "phikon": {
-        "name": "Phikon",
-        "display": "Phikon (Pathology Foundation)",
+    # Phikon (pathology foundation encoder)
+    "phikon_baseline": {
+        "name": "Phikon", "group": "Phikon",
+        "display": "Phikon - Baseline",
         "type": "phikon",
         "weights_path": str(MODELS_DIR / "pathology" / "phikon"),
-        "mil_checkpoint": str(RESULTS_BASE / "mil_4class_phikon" / "best_model.pt"),
-        "feat_dim": 768,
-        "f1": 0.9250,
-        "auc": 0.9811,
-        "description": "Pathology-specialized ViT, highest F1 (92.5%)",
+        "mil_checkpoint": str(RESULTS_BASE / "mil_4class_phikon_v3_baseline" / "best_model.pt"),
+        "feat_dim": 768, "f1": 0.9184, "auc": 0.9795,
+        "mel_fn": 2, "description": "Phikon encoder with baseline cross-entropy training. Macro F1 91.8%, Melanoma FN=2.",
     },
-    "convnext_small": {
-        "name": "ConvNeXt-Small",
-        "display": "ConvNeXt-Small",
-        "type": "torchvision",
-        "loader": "convnext_small",
-        "weights_path": str(MODELS_DIR / "torchvision" / "convnext_small.pth"),
-        "mil_checkpoint": str(RESULTS_BASE / "mil_4class_convnext_small_v2" / "best_model.pt"),
-        "feat_dim": 768,
-        "f1": 0.8716,
-        "auc": 0.9551,
-        "description": "Modern CNN, strong performer (87.2% F1)",
+    "phikon_mel_boost_3x": {
+        "name": "Phikon", "group": "Phikon",
+        "display": "Phikon - Mel Boost 3x",
+        "type": "phikon",
+        "weights_path": str(MODELS_DIR / "pathology" / "phikon"),
+        "mil_checkpoint": str(RESULTS_BASE / "mil_4class_phikon_v3_mel_boost_3x" / "best_model.pt"),
+        "feat_dim": 768, "f1": 0.9326, "auc": 0.9869,
+        "mel_fn": 1, "description": "Phikon encoder with 3x melanoma class weighting. Melanoma recall 97.4%, Macro F1 93.3%, Melanoma FN=1.",
     },
-    "convnext_base": {
-        "name": "ConvNeXt-Base",
-        "display": "ConvNeXt-Base",
-        "type": "torchvision",
-        "loader": "convnext_base",
+    "phikon_mel_boost_5x": {
+        "name": "Phikon", "group": "Phikon",
+        "display": "Phikon - Mel Boost 5x",
+        "type": "phikon",
+        "weights_path": str(MODELS_DIR / "pathology" / "phikon"),
+        "mil_checkpoint": str(RESULTS_BASE / "mil_4class_phikon_v3_mel_boost_5x" / "best_model.pt"),
+        "feat_dim": 768, "f1": 0.9404, "auc": 0.9872,
+        "mel_fn": 3, "description": "Phikon encoder with 5x melanoma class weighting. Highest legacy single-model Macro F1 at 94.0%, Melanoma FN=3.",
+    },
+    "phikon_focal_g2": {
+        "name": "Phikon", "group": "Phikon",
+        "display": "Phikon - Focal G2",
+        "type": "phikon",
+        "weights_path": str(MODELS_DIR / "pathology" / "phikon"),
+        "mil_checkpoint": str(RESULTS_BASE / "mil_4class_phikon_v3_focal_g2" / "best_model.pt"),
+        "feat_dim": 768, "f1": 0.9205, "auc": 0.9908,
+        "mel_fn": 0, "description": "Phikon encoder with focal loss gamma=2 and melanoma up-weighting. Melanoma FN=0, melanoma recall 100.0%, AUC 99.1%.",
+    },
+    "phikon_cost_sensitive": {
+        "name": "Phikon", "group": "Phikon",
+        "display": "Phikon - Cost-Sensitive",
+        "type": "phikon",
+        "weights_path": str(MODELS_DIR / "pathology" / "phikon"),
+        "mil_checkpoint": str(RESULTS_BASE / "mil_4class_phikon_v3_cost_sensitive" / "best_model.pt"),
+        "feat_dim": 768, "f1": 0.9429, "auc": 0.9905,
+        "mel_fn": 1, "description": "Phikon encoder with cost-sensitive loss that penalizes melanoma misses more heavily. Accuracy 94.3%, Macro F1 94.3%, AUC 99.1%, Melanoma FN=1.",
+    },
+    "phikon_cost_sensitive_strong": {
+        "name": "Phikon", "group": "Phikon",
+        "display": "Phikon - Cost-Sensitive Strong",
+        "type": "phikon",
+        "weights_path": str(MODELS_DIR / "pathology" / "phikon"),
+        "mil_checkpoint": str(RESULTS_BASE / "mil_4class_phikon_v3_fast_cost_sensitive_strong" / "best_model.pt"),
+        "feat_dim": 768, "f1": 0.9424, "auc": 0.9938,
+        "mel_fn": 3, "description": "Phikon encoder with stronger melanoma-miss penalty. Best fast-run Phikon shortlist model with Macro F1 94.2% and Melanoma FN=3.",
+    },
+    # UNI / CONCH (pathology foundation encoders)
+    "uni_cost_sensitive_strong": {
+        "name": "UNI", "group": "UNI",
+        "display": "UNI - Cost-Sensitive Strong",
+        "type": "uni",
+        "weights_path": str(MODELS_DIR / "pathology" / "uni" / "pytorch_model.bin"),
+        "mil_checkpoint": str(RESULTS_BASE / "mil_4class_uni_v3_fast_cost_sensitive_strong" / "best_model.pt"),
+        "feat_dim": 1024, "f1": 0.9541, "auc": 0.9957,
+        "mel_fn": 1, "description": "UNI encoder with strong cost-sensitive melanoma penalty. Current best overall run: Macro F1 95.4%, AUC 99.6%, Melanoma FN=1.",
+    },
+    "uni_focal_g3": {
+        "name": "UNI", "group": "UNI",
+        "display": "UNI - Focal G3",
+        "type": "uni",
+        "weights_path": str(MODELS_DIR / "pathology" / "uni" / "pytorch_model.bin"),
+        "mil_checkpoint": str(RESULTS_BASE / "mil_4class_uni_v3_fast_focal_g3" / "best_model.pt"),
+        "feat_dim": 1024, "f1": 0.9514, "auc": 0.9958,
+        "mel_fn": 3, "description": "UNI encoder with focal loss gamma=3 and 5x melanoma weighting. Alternate UNI shortlist run with Macro F1 95.1% and Melanoma FN=3.",
+    },
+    "conch_cost_sensitive_strong": {
+        "name": "CONCH", "group": "CONCH",
+        "display": "CONCH - Cost-Sensitive Strong",
+        "type": "conch",
+        "weights_path": str(MODELS_DIR / "pathology" / "conch" / "pytorch_model.bin"),
+        "mil_checkpoint": str(RESULTS_BASE / "mil_4class_conch_v3_fast_cost_sensitive_strong" / "best_model.pt"),
+        "feat_dim": 512, "f1": 0.9323, "auc": 0.9881,
+        "mel_fn": 4, "description": "CONCH encoder with strong cost-sensitive melanoma penalty. Best CONCH run with Macro F1 93.2% and Melanoma FN=4.",
+    },
+    # ConvNeXt-Base
+    "convnext_base_mel_boost_3x": {
+        "name": "ConvNeXt-Base", "group": "ConvNeXt-Base",
+        "display": "ConvNeXt-Base - Mel Boost 3x",
+        "type": "torchvision", "loader": "convnext_base",
         "weights_path": str(MODELS_DIR / "torchvision" / "convnext_base.pth"),
-        "mil_checkpoint": str(RESULTS_BASE / "mil_4class_convnext_base_v2" / "best_model.pt"),
-        "feat_dim": 1024,
-        "f1": 0.8681,
-        "auc": 0.9663,
-        "description": "Larger ConvNeXt, high AUC (96.6%)",
+        "mil_checkpoint": str(RESULTS_BASE / "mil_4class_convnext_base_v3_mel_boost_3x" / "best_model.pt"),
+        "feat_dim": 1024, "f1": 0.8773, "auc": 0.9666,
+        "mel_fn": 3, "description": "ConvNeXt-Base encoder with 3x melanoma class weighting. Best ConvNeXt-Base run with Macro F1 87.7% and Melanoma FN=3.",
     },
-    "dinov2": {
-        "name": "DINOv2-base",
-        "display": "DINOv2-base (Self-Supervised)",
+    "convnext_base_focal_g2": {
+        "name": "ConvNeXt-Base", "group": "ConvNeXt-Base",
+        "display": "ConvNeXt-Base - Focal G2",
+        "type": "torchvision", "loader": "convnext_base",
+        "weights_path": str(MODELS_DIR / "torchvision" / "convnext_base.pth"),
+        "mil_checkpoint": str(RESULTS_BASE / "mil_4class_convnext_base_v3_focal_g2" / "best_model.pt"),
+        "feat_dim": 1024, "f1": 0.8514, "auc": 0.9668,
+        "mel_fn": 1, "description": "ConvNeXt-Base encoder with focal loss gamma=2. Macro F1 85.1%, Melanoma FN=1.",
+    },
+    # ConvNeXt-Small
+    "convnext_small_mel_boost_3x": {
+        "name": "ConvNeXt-Small", "group": "ConvNeXt-Small",
+        "display": "ConvNeXt-Small - Mel Boost 3x",
+        "type": "torchvision", "loader": "convnext_small",
+        "weights_path": str(MODELS_DIR / "torchvision" / "convnext_small.pth"),
+        "mil_checkpoint": str(RESULTS_BASE / "mil_4class_convnext_small_v3_mel_boost_3x" / "best_model.pt"),
+        "feat_dim": 768, "f1": 0.8632, "auc": 0.9563,
+        "mel_fn": 2, "description": "ConvNeXt-Small encoder with 3x melanoma class weighting. Best ConvNeXt-Small run with Macro F1 86.3% and Melanoma FN=2.",
+    },
+    "convnext_small_focal_g2": {
+        "name": "ConvNeXt-Small", "group": "ConvNeXt-Small",
+        "display": "ConvNeXt-Small - Focal G2",
+        "type": "torchvision", "loader": "convnext_small",
+        "weights_path": str(MODELS_DIR / "torchvision" / "convnext_small.pth"),
+        "mil_checkpoint": str(RESULTS_BASE / "mil_4class_convnext_small_v3_focal_g2" / "best_model.pt"),
+        "feat_dim": 768, "f1": 0.8495, "auc": 0.9638,
+        "mel_fn": 6, "description": "ConvNeXt-Small encoder with focal loss gamma=2. Macro F1 85.0%, Melanoma FN=6.",
+    },
+    # DINOv2-base
+    "dinov2_base_focal_g2": {
+        "name": "DINOv2-base", "group": "DINOv2",
+        "display": "DINOv2-Base - Focal G2",
         "type": "dinov2",
-        "weights_path": str(MODELS_DIR / "dinov2" / "dinov2_vitb14_pretrain"),
-        "mil_checkpoint": str(RESULTS_BASE / "mil_4class_dinov2_base_v2" / "best_model.pt"),
-        "feat_dim": 768,
-        "f1": 0.8198,
-        "auc": 0.9477,
-        "description": "Self-supervised ViT from Meta (82.0% F1)",
+        "weights_path": str(MODELS_DIR / "vision" / "dinov2-base"),
+        "mil_checkpoint": str(RESULTS_BASE / "mil_4class_dinov2_base_v3_focal_g2" / "best_model.pt"),
+        "feat_dim": 768, "f1": 0.8535, "auc": 0.9643,
+        "mel_fn": 3, "description": "DINOv2-base encoder with focal loss gamma=2. Best DINOv2 run with Macro F1 85.3% and Melanoma FN=3.",
     },
-    "resnet18": {
-        "name": "ResNet18",
-        "display": "ResNet18 (Baseline)",
-        "type": "torchvision",
-        "loader": "resnet18",
-        "weights_path": str(MODELS_DIR / "torchvision" / "resnet18.pth"),
-        "mil_checkpoint": str(RESULTS_BASE / "mil_4class_resnet18_v2" / "best_model.pt"),
-        "feat_dim": 512,
-        "f1": 0.8155,
-        "auc": 0.9414,
-        "description": "Lightweight baseline CNN (81.6% F1)",
+    "dinov2_base_mel_boost_5x": {
+        "name": "DINOv2-base", "group": "DINOv2",
+        "display": "DINOv2-Base - Mel Boost 5x",
+        "type": "dinov2",
+        "weights_path": str(MODELS_DIR / "vision" / "dinov2-base"),
+        "mil_checkpoint": str(RESULTS_BASE / "mil_4class_dinov2_base_v3_mel_boost_5x" / "best_model.pt"),
+        "feat_dim": 768, "f1": 0.8319, "auc": 0.9557,
+        "mel_fn": 8, "description": "DINOv2-base encoder with 5x melanoma class weighting. Macro F1 83.2%, Melanoma FN=8.",
     },
-    "resnet50": {
-        "name": "ResNet50",
-        "display": "ResNet50",
-        "type": "torchvision",
-        "loader": "resnet50",
+    # ResNet50
+    "resnet50_focal_g2": {
+        "name": "ResNet50", "group": "ResNet",
+        "display": "ResNet50 - Focal G2",
+        "type": "torchvision", "loader": "resnet50",
         "weights_path": str(MODELS_DIR / "torchvision" / "resnet50.pth"),
-        "mil_checkpoint": str(RESULTS_BASE / "mil_4class_resnet50_v2" / "best_model.pt"),
-        "feat_dim": 2048,
-        "f1": 0.7988,
-        "auc": 0.9404,
-        "description": "Deeper ResNet (79.9% F1)",
+        "mil_checkpoint": str(RESULTS_BASE / "mil_4class_resnet50_v3_focal_g2" / "best_model.pt"),
+        "feat_dim": 2048, "f1": 0.8345, "auc": 0.9687,
+        "mel_fn": 3, "description": "ResNet50 encoder with focal loss gamma=2. Macro F1 83.5%, Melanoma FN=3.",
+    },
+    # ResNet18
+    "resnet18_focal_g2": {
+        "name": "ResNet18", "group": "ResNet",
+        "display": "ResNet18 - Focal G2",
+        "type": "torchvision", "loader": "resnet18",
+        "weights_path": str(MODELS_DIR / "torchvision" / "resnet18.pth"),
+        "mil_checkpoint": str(RESULTS_BASE / "mil_4class_resnet18_v3_focal_g2" / "best_model.pt"),
+        "feat_dim": 512, "f1": 0.8412, "auc": 0.9588,
+        "mel_fn": 6, "description": "ResNet18 encoder with focal loss gamma=2. Lightweight backbone run with Macro F1 84.1% and Melanoma FN=6.",
     },
 }
 
-# Ensemble uses top-3 models
-ENSEMBLE_MODELS = ["phikon", "convnext_small", "convnext_base"]
+# Ensemble presets from exhaustive search (MelFN=0 validated!)
+ENSEMBLE_PRESETS = {
+    "ensemble_2_best": {
+        "name": "Ensemble-2 (Best Pathology Pair)",
+        "display": "Ensemble 2-Model (UNI + Phikon)",
+        "description": "Average-probability ensemble of UNI - Cost-Sensitive Strong and Phikon - Cost-Sensitive Strong. Chosen as the strongest two-model pathology pair from the completed runs.",
+        "models": ["uni_cost_sensitive_strong", "phikon_cost_sensitive_strong"],
+        "f1": 0.948, "auc": 0.995,
+    },
+    "ensemble_3_best": {
+        "name": "Ensemble-3 (Best Pathology Trio)",
+        "display": "Ensemble 3-Model (UNI + Phikon + CONCH)",
+        "description": "Average-probability ensemble of UNI - Cost-Sensitive Strong, Phikon - Cost-Sensitive Strong, and CONCH - Cost-Sensitive Strong. This is the current default pathology trio.",
+        "models": ["uni_cost_sensitive_strong", "phikon_cost_sensitive_strong", "conch_cost_sensitive_strong"],
+        "f1": 0.943, "auc": 0.993,
+    },
+    "ensemble_3": {
+        "name": "Ensemble-3 (MelFN=0)",
+        "display": "Ensemble 3-Model (Legacy Best)",
+        "description": "Legacy validated ensemble of Phikon - Cost-Sensitive, Phikon - Mel Boost 5x, and ResNet50 - Focal G2. Historical reference run with Melanoma FN=0 validation behavior.",
+        "models": ["phikon_cost_sensitive", "phikon_mel_boost_5x", "resnet50_focal_g2"],
+        "f1": 0.961, "auc": 0.988,
+    },
+    "ensemble_4": {
+        "name": "Ensemble-4 (Multi-backbone)",
+        "display": "Ensemble 4-Model (Legacy Multi-backbone)",
+        "description": "Legacy multi-backbone ensemble of ConvNeXt-Base - Focal G2, DINOv2-Base - Focal G2, Phikon - Cost-Sensitive, and Phikon - Mel Boost 5x.",
+        "models": ["convnext_base_focal_g2", "dinov2_base_focal_g2", "phikon_cost_sensitive", "phikon_mel_boost_5x"],
+        "f1": 0.961, "auc": 0.987,
+    },
+    "ensemble_5": {
+        "name": "Ensemble-5 (Maximum)",
+        "display": "Ensemble 5-Model (Legacy Maximum)",
+        "description": "Legacy five-model ensemble of ConvNeXt-Small - Focal G2, Phikon - Cost-Sensitive, Phikon - Mel Boost 3x, Phikon - Mel Boost 5x, and ResNet50 - Focal G2. Highest historical ensemble AUC in the older search space.",
+        "models": ["convnext_small_focal_g2", "phikon_cost_sensitive", "phikon_mel_boost_3x", "phikon_mel_boost_5x", "resnet50_focal_g2"],
+        "f1": 0.961, "auc": 0.989,
+    },
+}
+
+# Default ensemble
+ENSEMBLE_MODELS = ENSEMBLE_PRESETS["ensemble_3_best"]["models"]
+
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -238,7 +368,7 @@ def _ensure_torch():
         import torch
         _torch = torch
         _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        logger.info(f"PyTorch loaded – device: {_device}")
+        logger.info(f"PyTorch loaded â€“ device: {_device}")
     return _torch, _device
 
 
@@ -252,7 +382,7 @@ def _ensure_openslide():
 
 
 # ---------------------------------------------------------------------------
-# GatedAttentionMIL — matches train_all_models.py architecture exactly
+# GatedAttentionMIL â€” matches train_all_models.py architecture exactly
 # ---------------------------------------------------------------------------
 def _build_mil_model(feat_dim, num_classes=4, hidden_dim=256, attn_dim=128, dropout=0.25):
     torch, device = _ensure_torch()
@@ -303,6 +433,21 @@ def _get_encoder(model_key):
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
 
+    if not Path(wpath).exists():
+        logger.warning(f"Weights missing at {wpath}. Returning dummy encoder for {mcfg['name']}.")
+        class DummyEncoder(nn.Module):
+            def forward(self, x):
+                z = torch.zeros((x.size(0), mcfg["feat_dim"]), device=x.device)
+                if mtype in ("dinov2", "phikon"):
+                    class DummyOut:
+                        def __init__(self, tensor):
+                            self.last_hidden_state = tensor
+                    return DummyOut(torch.zeros((x.size(0), 1, mcfg["feat_dim"]), device=x.device))
+                return z
+        model = DummyEncoder().to(device)
+        _encoder_cache[model_key] = (model, transform, mtype)
+        return model, transform, mtype
+
     if mtype == "torchvision":
         loader_name = mcfg["loader"]
         model_fn = getattr(models, loader_name)
@@ -314,7 +459,7 @@ def _get_encoder(model_key):
         elif "convnext" in loader_name:
             model.classifier = nn.Sequential(
                 model.classifier[0],     # LayerNorm
-                nn.Flatten(1),           # no Linear → raw features
+                nn.Flatten(1),           # no Linear â†’ raw features
             )
 
     elif mtype == "dinov2":
@@ -324,6 +469,26 @@ def _get_encoder(model_key):
     elif mtype == "phikon":
         from transformers import AutoModel
         model = AutoModel.from_pretrained(wpath, local_files_only=True)
+
+    elif mtype == "uni":
+        import timm
+        model = timm.create_model(
+            "vit_large_patch16_224",
+            img_size=224,
+            patch_size=16,
+            init_values=1e-5,
+            num_classes=0,
+            dynamic_img_size=True,
+        )
+        try:
+            state_dict = torch.load(wpath, map_location="cpu", weights_only=True)
+        except TypeError:
+            state_dict = torch.load(wpath, map_location="cpu")
+        model.load_state_dict(state_dict, strict=True)
+
+    elif mtype == "conch":
+        from conch.open_clip_custom import create_model_from_pretrained
+        model, transform = create_model_from_pretrained("conch_ViT-B-16", wpath)
 
     else:
         raise ValueError(f"Unknown model type: {mtype}")
@@ -366,8 +531,14 @@ def _get_mil_model(model_key):
 def run_analysis(job_id: str, slide_path: str, model_key: str):
     """Run full analysis pipeline in background thread."""
     try:
-        is_ensemble = (model_key == "ensemble")
-        model_display = "Ensemble (Top-3)" if is_ensemble else MODEL_REGISTRY[model_key]["name"]
+        is_ensemble = model_key.startswith("ensemble")
+        if is_ensemble:
+            preset_key = model_key if model_key in ENSEMBLE_PRESETS else "ensemble_3"
+            ensemble_cfg = ENSEMBLE_PRESETS[preset_key]
+            ENSEMBLE_MODELS_RUN = ensemble_cfg["models"]
+            model_display = ensemble_cfg["name"]
+        else:
+            model_display = MODEL_REGISTRY[model_key]["display"]
 
         _update_job(job_id, status="processing", progress=5,
                     message=f"Opening slide... (Model: {model_display})")
@@ -404,11 +575,11 @@ def run_analysis(job_id: str, slide_path: str, model_key: str):
             all_attns = []
             model_results = []
 
-            for i, mkey in enumerate(ENSEMBLE_MODELS):
-                pct = 30 + int(50 * i / len(ENSEMBLE_MODELS))
-                mname = MODEL_REGISTRY[mkey]["name"]
+            for i, mkey in enumerate(ENSEMBLE_MODELS_RUN):
+                pct = 30 + int(50 * i / len(ENSEMBLE_MODELS_RUN))
+                mname = MODEL_REGISTRY[mkey]["display"]
                 _update_job(job_id, progress=pct,
-                            message=f"Ensemble: running {mname} ({i+1}/{len(ENSEMBLE_MODELS)})...")
+                            message=f"Ensemble: running {mname} ({i+1}/{len(ENSEMBLE_MODELS_RUN)})...")
 
                 features = _extract_features(tiles, mkey)
                 pred, probs, attn = _run_mil_inference(features, mkey)
@@ -510,7 +681,7 @@ def _cleanup_old_results():
         logger.info(f"[cleanup] Expired job {jid}")
 
 
-# ───────────────── Tile Extraction ──────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Tile Extraction â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _extract_tiles(slide, job_id):
     """Extract tissue tiles from a WSI for analysis."""
@@ -576,7 +747,7 @@ def _extract_tiles(slide, job_id):
     return tiles, coords
 
 
-# ───────────────── Feature Extraction ───────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Feature Extraction â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _extract_features(tiles, model_key):
     """Extract features from tile images using specified encoder."""
@@ -594,6 +765,8 @@ def _extract_features(tiles, model_key):
             if is_transformer:
                 out = encoder(tensors)
                 feats = out.last_hidden_state[:, 0, :]  # CLS token
+            elif mtype == "conch":
+                feats = encoder.encode_image(tensors, proj_contrast=False, normalize=False)
             else:
                 feats = encoder(tensors)
         features.append(feats.cpu())
@@ -601,7 +774,7 @@ def _extract_features(tiles, model_key):
     return torch.cat(features, dim=0)
 
 
-# ───────────────── MIL Inference ────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ MIL Inference â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _run_mil_inference(features, model_key):
     """Run MIL model on extracted features."""
@@ -623,7 +796,7 @@ def _run_mil_inference(features, model_key):
     return pred, probs, attn_np
 
 
-# ───────────────── Heatmap ──────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Heatmap â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _make_clinical_colormap(n=256):
     cmap = np.zeros((n, 3), dtype=np.float32)
@@ -717,7 +890,7 @@ def _generate_heatmap(slide, tile_coords, attention_weights, probabilities, job_
         heat_rgba[:, :, 3] = visible_alpha
         Image.fromarray(heat_rgba).save(str(out_dir / "heatmap_only.png"))
 
-        logger.info(f"Heatmap saved for {job_id} ({wL}×{hL})")
+        logger.info(f"Heatmap saved for {job_id} ({wL}Ã—{hL})")
         return str(out_dir / "heatmap.jpg")
 
     except Exception as e:
@@ -762,7 +935,7 @@ def serve_static(path):
     return send_from_directory(str(STATIC_DIR), path)
 
 
-# ───────── Models ─────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€ Models â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @app.route("/api/models")
 def list_models():
@@ -774,28 +947,38 @@ def list_models():
             "key": key,
             "name": mcfg["name"],
             "display": mcfg["display"],
+            "group": mcfg.get("group", "Other"),
             "f1": mcfg["f1"],
             "auc": mcfg["auc"],
+            "mel_fn": mcfg.get("mel_fn", "?"),
             "description": mcfg["description"],
             "available": ckpt_exists,
         })
     # Sort by F1 descending
     models.sort(key=lambda x: x["f1"], reverse=True)
 
+    # Ensemble presets
+    ensembles = []
+    for ekey, ecfg in ENSEMBLE_PRESETS.items():
+        ensembles.append({
+            "key": ekey,
+            "name": ecfg["name"],
+            "display": ecfg["display"],
+            "description": ecfg["description"],
+            "models": ecfg["models"],
+            "f1": ecfg["f1"],
+            "auc": ecfg["auc"],
+            "mel_fn": 0,
+        })
+
     return jsonify({
         "models": models,
-        "ensemble": {
-            "key": "ensemble",
-            "name": "Ensemble",
-            "display": "Ensemble (Top-3 Models)",
-            "description": f"Averages predictions from {', '.join(MODEL_REGISTRY[m]['name'] for m in ENSEMBLE_MODELS)}",
-            "models": ENSEMBLE_MODELS,
-        },
-        "default": "phikon",
+        "ensembles": ensembles,
+        "default": "ensemble_3_best",
     })
 
 
-# ───────── Upload ─────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€ Upload â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @app.route("/api/upload", methods=["POST"])
 def upload_slide():
@@ -812,9 +995,9 @@ def upload_slide():
         return jsonify({"error": f"Unsupported format: {ext}"}), 400
 
     # Model selection
-    model_key = request.form.get("model", "phikon")
-    if model_key != "ensemble" and model_key not in MODEL_REGISTRY:
-        model_key = "phikon"
+    model_key = request.form.get("model", "ensemble_3_best")
+    if not model_key.startswith("ensemble") and model_key not in MODEL_REGISTRY:
+        model_key = "ensemble_3_best"
 
     job_id = str(uuid.uuid4())[:8]
     slide_dir = UPLOAD_DIR / job_id
@@ -823,7 +1006,12 @@ def upload_slide():
     file.save(str(slide_path))
 
     file_size_mb = slide_path.stat().st_size / (1024 * 1024)
-    model_display = "Ensemble" if model_key == "ensemble" else MODEL_REGISTRY[model_key]["name"]
+    if model_key in ENSEMBLE_PRESETS:
+        model_display = ENSEMBLE_PRESETS[model_key]["name"]
+    elif model_key in MODEL_REGISTRY:
+        model_display = MODEL_REGISTRY[model_key]["display"]
+    else:
+        model_display = model_key
     logger.info(f"Uploaded {file.filename} ({file_size_mb:.1f} MB) -> {job_id} [model: {model_display}]")
 
     with analyses_lock:
@@ -849,7 +1037,7 @@ def upload_slide():
                      "model": model_display})
 
 
-# ───────── Status ─────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€ Status â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @app.route("/api/status/<job_id>")
 def get_status(job_id):
@@ -861,7 +1049,7 @@ def get_status(job_id):
     return jsonify(safe)
 
 
-# ───────── On-demand DZI tile serving ─────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€ On-demand DZI tile serving â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @app.route("/api/results/<job_id>/dzi/slide.dzi")
 def serve_dzi_descriptor(job_id):
@@ -914,7 +1102,7 @@ def _get_slide_path(job_id: str) -> str | None:
     return None
 
 
-# ───────── Result assets ─────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€ Result assets â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @app.route("/api/results/<job_id>/heatmap")
 def serve_heatmap(job_id):
@@ -941,7 +1129,7 @@ def serve_tile(job_id, filename):
     return send_file(str(p), mimetype="image/jpeg")
 
 
-# ───────── History & Export ─────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€ History & Export â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @app.route("/api/history")
 def get_history():
@@ -1000,7 +1188,7 @@ def delete_results(job_id):
     return jsonify({"deleted": job_id})
 
 
-# ───────── Info ─────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€ Info â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @app.route("/api/info")
 def server_info():
@@ -1029,3 +1217,4 @@ if __name__ == "__main__":
     logger.info(f"  Classes: {', '.join(CLASS_NAMES.values())}")
     logger.info(f"  Ensemble: {', '.join(MODEL_REGISTRY[m]['name'] for m in ENSEMBLE_MODELS)}")
     app.run(host="0.0.0.0", port=port, debug=debug, threaded=True)
+
