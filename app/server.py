@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 SkinSight â€“ Whole Slide Image Analysis Server  (v3 â€“ multi-model)
 ================================================================
@@ -36,12 +36,30 @@ PROJECT_DIR = APP_DIR.parent
 UPLOAD_DIR = APP_DIR / "uploads"
 RESULTS_DIR = APP_DIR / "results"
 STATIC_DIR = APP_DIR / "static"
+PHASE1_BANK_DIR = PROJECT_DIR / "results" / "phase1_hard_case_bank"
+PHASE2_DIR = PROJECT_DIR / "results" / "phase2_safety"
+PHASE2_CALIBRATION_PATH = PHASE2_DIR / "calibration_registry.json"
+PHASE2_OOD_PATH = PHASE2_DIR / "ood_registry.json"
+PHASE4_DIR = PROJECT_DIR / "results" / "phase4_retrieval"
+PHASE4_RETRIEVAL_PATH = PHASE4_DIR / "retrieval_registry.json"
+PHASE4_EMBEDDINGS_PATH = PHASE4_DIR / "retrieval_embeddings.npz"
+PHASE4_THUMB_DIR = PHASE4_DIR / "thumbnails"
+PHASE0_DIR = PROJECT_DIR / "results" / "phase0_registry"
+PHASE0_THRESHOLD_PATH = PHASE0_DIR / "threshold_registry.json"
+PHASE0_EXPERIMENT_PATH = PHASE0_DIR / "experiment_registry.json"
 
 sys.path.insert(0, str(PROJECT_DIR))
 sys.path.insert(0, str(PROJECT_DIR / "src"))
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+PHASE1_BANK_DIR.mkdir(parents=True, exist_ok=True)
+PHASE2_DIR.mkdir(parents=True, exist_ok=True)
+PHASE4_DIR.mkdir(parents=True, exist_ok=True)
+PHASE4_THUMB_DIR.mkdir(parents=True, exist_ok=True)
+PHASE0_DIR.mkdir(parents=True, exist_ok=True)
+
+phase1_case_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -57,6 +75,22 @@ class AppConfig:
     TILE_SIZE = 256
     MIN_TISSUE_FRACTION = 0.3
     FEATURE_BATCH_SIZE = 32
+
+    # Phase 1 safety thresholds
+    ABSTAIN_CONFIDENCE_THRESHOLD = 0.62
+    HIGH_UNCERTAINTY_THRESHOLD = 0.58
+    MODERATE_UNCERTAINTY_THRESHOLD = 0.42
+    LOW_MARGIN_THRESHOLD = 0.18
+    MELANOMA_BORDERLINE_PROB = 0.20
+    MELANOMA_HIGH_RISK_PROB = 0.35
+    ENSEMBLE_DISAGREEMENT_THRESHOLD = 0.34
+
+    # Phase 2 safety thresholds
+    OOD_STRONG_THRESHOLD = 1.35
+    OOD_MODERATE_THRESHOLD = 1.05
+    UNIFIED_SAFETY_HIGH = 0.72
+    UNIFIED_SAFETY_MODERATE = 0.48
+    DEFAULT_TEMPERATURE = 1.0
 
     # DZI (on-demand)
     DZI_TILE_SIZE = 254
@@ -78,6 +112,40 @@ N_CLASSES = 4
 # ---------------------------------------------------------------------------
 MODELS_DIR = Path("/mnt/d/skin_cancer_project/models")
 RESULTS_BASE = PROJECT_DIR / "results"
+
+
+def _windows_style_from_wsl_path(path_str: str):
+    path_str = str(path_str)
+    if path_str.startswith("/mnt/") and len(path_str) > 6:
+        drive = path_str[5]
+        rest = path_str[7:].replace("/", "\\")
+        return f"{drive.upper()}:\\{rest}"
+    return None
+
+
+def _likely_unmounted_windows_drive(path_str: str) -> bool:
+    path = str(path_str)
+    if not path.startswith("/mnt/"):
+        return False
+    parts = Path(path).parts
+    if len(parts) < 3:
+        return False
+    mount_root = Path(parts[0]) / parts[1] / parts[2]
+    try:
+        return mount_root.exists() and not any(mount_root.iterdir())
+    except Exception:
+        return False
+
+
+def _weights_missing_message(model_name: str, path_str: str) -> str:
+    windows_hint = _windows_style_from_wsl_path(path_str)
+    message = f"Required weights for {model_name} were not found at {path_str}."
+    if _likely_unmounted_windows_drive(path_str):
+        mount_cmd = "sudo mount -t drvfs D: /mnt/d"
+        message += f" The Windows D: drive appears to be unmounted in WSL. Mount it with `{mount_cmd}` and restart the server."
+    elif windows_hint:
+        message += f" Expected Windows-side location: `{windows_hint}`."
+    return message
 
 MODEL_REGISTRY = {
     # Phikon (pathology foundation encoder)
@@ -294,6 +362,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("skinsight")
 
+if not MODELS_DIR.exists():
+    logger.warning(
+        "Model directory %s is not visible inside WSL. If your models are on Windows D:, mount it with `sudo mount -t drvfs D: /mnt/d` before starting the server.",
+        MODELS_DIR,
+    )
+
 # ---------------------------------------------------------------------------
 # Flask
 # ---------------------------------------------------------------------------
@@ -360,6 +434,9 @@ _device = None
 # Cache loaded encoders and MIL models by key
 _encoder_cache = {}       # model_key -> (encoder, transform)
 _mil_model_cache = {}     # model_key -> GatedAttentionMIL
+_phase2_registry_cache = {}
+_phase4_registry_cache = {}
+_phase0_registry_cache = {}
 
 
 def _ensure_torch():
@@ -406,7 +483,8 @@ def _build_mil_model(feat_dim, num_classes=4, hidden_dim=256, attn_dim=128, drop
             a = self.attention_W(self.attention_V(h) * self.attention_U(h))
             a = F.softmax(a, dim=0)
             z = torch.sum(a * h, dim=0, keepdim=True)
-            return self.classifier(z), a.squeeze()
+            logits = self.classifier(z)
+            return logits, a.squeeze(), z.squeeze(0), h
 
     return GatedAttentionMIL()
 
@@ -434,19 +512,9 @@ def _get_encoder(model_key):
     ])
 
     if not Path(wpath).exists():
-        logger.warning(f"Weights missing at {wpath}. Returning dummy encoder for {mcfg['name']}.")
-        class DummyEncoder(nn.Module):
-            def forward(self, x):
-                z = torch.zeros((x.size(0), mcfg["feat_dim"]), device=x.device)
-                if mtype in ("dinov2", "phikon"):
-                    class DummyOut:
-                        def __init__(self, tensor):
-                            self.last_hidden_state = tensor
-                    return DummyOut(torch.zeros((x.size(0), 1, mcfg["feat_dim"]), device=x.device))
-                return z
-        model = DummyEncoder().to(device)
-        _encoder_cache[model_key] = (model, transform, mtype)
-        return model, transform, mtype
+        message = _weights_missing_message(mcfg["name"], wpath)
+        logger.error(message)
+        raise FileNotFoundError(message)
 
     if mtype == "torchvision":
         loader_name = mcfg["loader"]
@@ -572,7 +640,12 @@ def run_analysis(job_id: str, slide_path: str, model_key: str):
         if is_ensemble:
             # Run ensemble: extract features & run MIL for each model
             all_probs = []
+            all_raw_probs = []
             all_attns = []
+            all_preds = []
+            all_bag_embeddings = []
+            all_calibrations = []
+            all_contrastive_views = []
             model_results = []
 
             for i, mkey in enumerate(ENSEMBLE_MODELS_RUN):
@@ -582,9 +655,24 @@ def run_analysis(job_id: str, slide_path: str, model_key: str):
                             message=f"Ensemble: running {mname} ({i+1}/{len(ENSEMBLE_MODELS_RUN)})...")
 
                 features = _extract_features(tiles, mkey)
-                pred, probs, attn = _run_mil_inference(features, mkey)
+                pred, probs, attn, bag_embedding, raw_probs, contrastive_views = _run_mil_inference(features, mkey)
                 all_probs.append(probs)
+                all_raw_probs.append(raw_probs)
                 all_attns.append(attn)
+                all_preds.append(pred)
+                all_bag_embeddings.append(bag_embedding)
+                all_contrastive_views.append(contrastive_views)
+                calibration_meta = _get_calibration_entry(mkey) or {}
+                all_calibrations.append({
+                    "model_key": mkey,
+                    "model_display": MODEL_REGISTRY[mkey]["display"],
+                    "available": bool(calibration_meta),
+                    "temperature": round(float(calibration_meta.get("temperature", cfg.DEFAULT_TEMPERATURE)), 4),
+                    "ece_before": calibration_meta.get("ece_before"),
+                    "ece_after": calibration_meta.get("ece_after"),
+                    "mce_before": calibration_meta.get("mce_before"),
+                    "mce_after": calibration_meta.get("mce_after"),
+                })
                 model_results.append({
                     "model": mname,
                     "prediction": CLASS_NAMES[pred],
@@ -593,10 +681,27 @@ def run_analysis(job_id: str, slide_path: str, model_key: str):
 
             # Average probabilities
             avg_probs = np.mean(all_probs, axis=0)
+            avg_raw_probs = np.mean(all_raw_probs, axis=0)
             prediction = int(avg_probs.argmax())
             probabilities = avg_probs
-            # Average attention for heatmap
-            attention_weights = np.mean(all_attns, axis=0)
+            attention_views = _build_ensemble_attention_views(all_attns)
+            attention_views.update(_aggregate_attention_view_dicts(all_contrastive_views))
+            attention_weights = attention_views.get("consensus", np.mean(all_attns, axis=0))
+            safety = _build_phase1_safety(prediction, probabilities, ensemble_predictions=all_preds)
+            safety = _merge_phase2_ensemble_safety(
+                safety,
+                probabilities,
+                ENSEMBLE_MODELS_RUN,
+                all_bag_embeddings,
+                all_calibrations,
+                raw_probabilities=avg_raw_probs,
+            )
+            safety = _annotate_threshold_policy(safety, model_key)
+            retrieval = _retrieve_similar_cases(
+                model_key,
+                ensemble_model_keys=ENSEMBLE_MODELS_RUN,
+                ensemble_bag_embeddings=all_bag_embeddings,
+            )
 
         else:
             # Single model
@@ -605,39 +710,85 @@ def run_analysis(job_id: str, slide_path: str, model_key: str):
             features = _extract_features(tiles, model_key)
 
             _update_job(job_id, progress=65, message="Running MIL inference...")
-            prediction, probabilities, attention_weights = _run_mil_inference(features, model_key)
+            prediction, probabilities, attention_weights, bag_embedding, raw_probabilities, contrastive_views = _run_mil_inference(features, model_key)
             model_results = None
+            attention_views = {"attention": _normalize_attention_weights(attention_weights)}
+            attention_views.update(contrastive_views)
+            safety = _build_phase1_safety(prediction, probabilities)
+            safety = _merge_phase2_safety(
+                safety,
+                probabilities,
+                model_key,
+                bag_embedding,
+                _get_calibration_entry(model_key) or {},
+                raw_probabilities=raw_probabilities,
+            )
+            safety = _annotate_threshold_policy(safety, model_key)
+            retrieval = _retrieve_similar_cases(model_key, bag_embedding=bag_embedding)
 
         _update_job(job_id, progress=80, message="Generating heatmap...")
 
         # Step 4: Generate heatmap
         heatmap_ok = _generate_heatmap(slide, tile_coords, attention_weights,
-                                       probabilities, job_id)
+                                       probabilities, job_id, variant="attention")
+        if is_ensemble:
+            _generate_heatmap(slide, tile_coords, attention_views["consensus"], probabilities, job_id, variant="consensus")
+            _generate_heatmap(slide, tile_coords, attention_views["disagreement"], probabilities, job_id, variant="disagreement")
+            _generate_heatmap(slide, tile_coords, attention_views["shared"], probabilities, job_id, variant="shared")
+        for contrastive_key in [k for k in attention_views.keys() if k.startswith("contrast_")]:
+            _generate_heatmap(slide, tile_coords, attention_views[contrastive_key], probabilities, job_id, variant=contrastive_key)
 
         # Step 5: Top attention tiles
-        top_tiles = _get_top_attention_tiles(tiles, tile_coords,
-                                             attention_weights, job_id)
+        top_tiles = _get_top_attention_tiles(tiles, tile_coords, attention_weights, job_id)
+        if is_ensemble:
+            top_tiles = _annotate_top_tiles(
+                _get_top_attention_tiles(tiles, tile_coords, attention_views["shared"], job_id),
+                {
+                    "consensus_score": attention_views["consensus"],
+                    "disagreement_score": attention_views["disagreement"],
+                    "shared_score": attention_views["shared"],
+                },
+            )
 
         slide.close()
 
         result = {
-            "prediction": CLASS_NAMES[prediction],
+            "prediction": safety["display_prediction"],
+            "raw_prediction": CLASS_NAMES[prediction],
+            "prediction_key": safety["prediction_key"],
+            "decision_status": safety["decision_status"],
             "prediction_id": int(prediction),
             "probabilities": {
                 CLASS_NAMES[i]: round(float(probabilities[i]), 4)
                 for i in range(N_CLASSES)
             },
+            "safety": safety,
+            "threshold_policy": safety.get("threshold_policy") or _build_threshold_policy(model_key),
+            "retrieval": retrieval,
             "n_tiles": len(tiles),
             "top_tiles": top_tiles,
+            "top_tiles_title": "Areas of Strongest Shared Attention" if is_ensemble else "Top Attention Tiles",
+            "top_tiles_mode": "shared_consensus" if is_ensemble else "single_attention",
             "heatmap_available": heatmap_ok is not None,
+            "heatmap_views": _build_heatmap_view_list([
+                key for key in (
+                    (["consensus", "disagreement", "shared"] if is_ensemble else ["attention"]) +
+                    [k for k in attention_views.keys() if k.startswith("contrast_")]
+                )
+                if key in attention_views or key in ("attention", "consensus", "disagreement", "shared")
+            ]),
+            "default_heatmap_view": "consensus" if is_ensemble else "attention",
             "model_used": model_display,
             "model_key": model_key,
             "timestamp": datetime.now().isoformat(),
         }
+        result["artifacts"] = _build_result_artifacts(job_id, result)
 
         # For ensemble, include individual model predictions
         if model_results:
             result["ensemble_details"] = model_results
+
+        _record_phase1_inference_case(job_id, slide_path, model_key, model_display, slide_info, result)
 
         _update_job(job_id, status="completed", progress=100,
                     message="Analysis complete!", result=result)
@@ -784,19 +935,802 @@ def _run_mil_inference(features, model_key):
     if model is None:
         logger.warning(f"MIL model not available for {model_key}, returning uniform")
         n = features.shape[0]
-        return 0, np.ones(N_CLASSES) / N_CLASSES, np.ones(n) / n
+        return 0, np.ones(N_CLASSES) / N_CLASSES, np.ones(n) / n, np.zeros(256, dtype=np.float32), np.ones(N_CLASSES) / N_CLASSES, {}
 
     features = features.to(device)
     with torch.no_grad():
-        logits, attn = model(features)
-        probs = torch.nn.functional.softmax(logits, dim=1).cpu().numpy()[0]
-        pred = logits.argmax(1).item()
+        logits, attn, bag_embedding, tile_hidden = model(features)
+        tile_logits = model.classifier(tile_hidden)
+        raw_probs = torch.nn.functional.softmax(logits, dim=1).cpu().numpy()[0]
+        probs, _ = _apply_probability_calibration(raw_probs, model_key)
+        pred = int(np.argmax(probs))
         attn_np = attn.cpu().numpy().flatten()
+        bag_np = bag_embedding.detach().cpu().numpy().astype(np.float32)
+        contrastive_views = _build_contrastive_attention_views(
+            attn_np,
+            tile_logits.detach().cpu().numpy().astype(np.float32),
+        )
 
-    return pred, probs, attn_np
+    return pred, probs, attn_np, bag_np, raw_probs, contrastive_views
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Heatmap â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+def _normalized_entropy(probabilities):
+    probs = np.asarray(probabilities, dtype=np.float32)
+    probs = np.clip(probs, 1e-8, 1.0)
+    probs = probs / probs.sum()
+    return float(-(probs * np.log(probs)).sum() / np.log(len(probs)))
+
+
+def _normalize_attention_weights(attention_weights):
+    attn = np.asarray(attention_weights, dtype=np.float32).reshape(-1)
+    if attn.size == 0:
+        return attn
+    amin = float(attn.min())
+    amax = float(attn.max())
+    if amax > amin:
+        return (attn - amin) / (amax - amin)
+    return np.zeros_like(attn, dtype=np.float32)
+
+
+def _build_ensemble_attention_views(attention_list):
+    if not attention_list:
+        return {}
+
+    normalized = [_normalize_attention_weights(attn) for attn in attention_list]
+    stack = np.stack(normalized, axis=0)
+    consensus = stack.mean(axis=0)
+    disagreement = stack.std(axis=0)
+    shared = consensus * (1.0 - np.clip(disagreement, 0.0, 1.0))
+
+    return {
+        "consensus": _normalize_attention_weights(consensus),
+        "disagreement": _normalize_attention_weights(disagreement),
+        "shared": _normalize_attention_weights(shared),
+    }
+
+
+CONTRASTIVE_CLASS_PAIRS = [
+    ("melanoma", "scc"),
+    ("melanoma", "bcc"),
+]
+
+
+HEATMAP_VIEW_METADATA = {
+    "attention": {
+        "label": "Attention",
+        "description": "Single-model MIL attention heatmap.",
+    },
+    "consensus": {
+        "label": "Consensus",
+        "description": "Regions jointly emphasized by ensemble members.",
+    },
+    "disagreement": {
+        "label": "Disagreement",
+        "description": "Regions where ensemble attention diverges.",
+    },
+    "shared": {
+        "label": "Shared Focus",
+        "description": "Consensus weighted by low disagreement.",
+    },
+    "contrast_melanoma_vs_scc": {
+        "label": "Mel vs SCC",
+        "description": "Class-contrastive heatmap showing evidence for melanoma relative to SCC.",
+    },
+    "contrast_melanoma_vs_bcc": {
+        "label": "Mel vs BCC",
+        "description": "Class-contrastive heatmap showing evidence for melanoma relative to BCC.",
+    },
+}
+
+
+def _build_contrastive_attention_views(tile_attention, tile_class_scores):
+    attention = _normalize_attention_weights(tile_attention)
+    class_scores = np.asarray(tile_class_scores, dtype=np.float32)
+    if class_scores.ndim != 2 or class_scores.shape[1] != N_CLASSES:
+        return {}
+
+    views = {}
+    for pos_key, neg_key in CONTRASTIVE_CLASS_PAIRS:
+        pos_idx = CLASS_KEYS.index(pos_key)
+        neg_idx = CLASS_KEYS.index(neg_key)
+        pos_view = _normalize_attention_weights(class_scores[:, pos_idx])
+        contrast_view = _normalize_attention_weights(class_scores[:, pos_idx] - class_scores[:, neg_idx])
+        combined = _normalize_attention_weights(0.25 * attention + 0.25 * pos_view + 0.50 * contrast_view)
+        views[f"contrast_{pos_key}_vs_{neg_key}"] = combined
+    return views
+
+
+def _aggregate_attention_view_dicts(view_dicts):
+    if not view_dicts:
+        return {}
+    out = {}
+    all_keys = sorted({k for view_dict in view_dicts for k in view_dict.keys()})
+    for key in all_keys:
+        arrays = [np.asarray(view_dict[key], dtype=np.float32) for view_dict in view_dicts if key in view_dict]
+        if not arrays:
+            continue
+        out[key] = _normalize_attention_weights(np.mean(np.stack(arrays, axis=0), axis=0))
+    return out
+
+
+def _build_heatmap_view_list(view_keys):
+    views = []
+    for key in view_keys:
+        meta = HEATMAP_VIEW_METADATA.get(key, {})
+        views.append({
+            "key": key,
+            "label": meta.get("label", key),
+            "description": meta.get("description", key),
+        })
+    return views
+
+
+def _load_phase2_registry(path):
+    cache_key = str(path)
+    try:
+        mtime = path.stat().st_mtime
+    except FileNotFoundError:
+        _phase2_registry_cache.pop(cache_key, None)
+        return {}
+
+    cached = _phase2_registry_cache.get(cache_key)
+    if cached and cached["mtime"] == mtime:
+        return cached["data"]
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.exception("Failed to load Phase 2 registry: %s", path)
+        data = {}
+
+    _phase2_registry_cache[cache_key] = {"mtime": mtime, "data": data}
+    return data
+
+
+def _load_phase4_registry():
+    cache_key = f"{PHASE4_RETRIEVAL_PATH}|{PHASE4_EMBEDDINGS_PATH}"
+    try:
+        mtimes = (
+            PHASE4_RETRIEVAL_PATH.stat().st_mtime,
+            PHASE4_EMBEDDINGS_PATH.stat().st_mtime,
+        )
+    except FileNotFoundError:
+        _phase4_registry_cache.pop(cache_key, None)
+        return {}, {}
+
+    cached = _phase4_registry_cache.get(cache_key)
+    if cached and cached["mtimes"] == mtimes:
+        return cached["registry"], cached["arrays"]
+
+    try:
+        registry = json.loads(PHASE4_RETRIEVAL_PATH.read_text(encoding="utf-8"))
+        with np.load(PHASE4_EMBEDDINGS_PATH, allow_pickle=False) as data:
+            arrays = {key: data[key] for key in data.files}
+    except Exception:
+        logger.exception("Failed to load Phase 4 retrieval artifacts")
+        registry, arrays = {}, {}
+
+    _phase4_registry_cache[cache_key] = {
+        "mtimes": mtimes,
+        "registry": registry,
+        "arrays": arrays,
+    }
+    return registry, arrays
+
+
+def _load_phase0_registry(path):
+    cache_key = str(path)
+    try:
+        mtime = path.stat().st_mtime
+    except FileNotFoundError:
+        _phase0_registry_cache.pop(cache_key, None)
+        return {}
+
+    cached = _phase0_registry_cache.get(cache_key)
+    if cached and cached["mtime"] == mtime:
+        return cached["data"]
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.exception("Failed to load Phase 0 registry: %s", path)
+        data = {}
+
+    _phase0_registry_cache[cache_key] = {"mtime": mtime, "data": data}
+    return data
+
+
+def _get_threshold_registry():
+    return _load_phase0_registry(PHASE0_THRESHOLD_PATH)
+
+
+def _threshold_entry_from_registry(registry, model_key):
+    if not isinstance(registry, dict):
+        return {}
+    if model_key in registry:
+        return registry.get(model_key) or {}
+    for bucket_name in ("models", "ensembles", "thresholds", "entries"):
+        bucket = registry.get(bucket_name)
+        if isinstance(bucket, dict) and model_key in bucket:
+            return bucket.get(model_key) or {}
+    return {}
+
+
+def _coerce_threshold_value(entry):
+    for key in (
+        "melanoma_safe_threshold",
+        "best_melanoma_threshold",
+        "selected_threshold",
+        "melanoma_threshold",
+        "threshold",
+    ):
+        value = entry.get(key)
+        if value is not None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _build_threshold_policy(model_key):
+    registry = _get_threshold_registry()
+    entry = _threshold_entry_from_registry(registry, model_key)
+    threshold_value = _coerce_threshold_value(entry) if entry else None
+
+    policy = {
+        "available": bool(entry),
+        "model_key": model_key,
+        "default_threshold": float(entry.get("default_threshold", 0.5)) if entry else 0.5,
+        "melanoma_safe_threshold": threshold_value,
+        "selection_basis": entry.get("selection_basis") or entry.get("policy") or entry.get("threshold_basis"),
+        "source_run": entry.get("source_run"),
+        "source_csv": entry.get("source_csv"),
+        "source_results": entry.get("source_results"),
+        "evaluation_split": entry.get("evaluation_split"),
+        "notes": entry.get("notes"),
+    }
+    if model_key in ENSEMBLE_PRESETS:
+        policy["components"] = ENSEMBLE_PRESETS[model_key]["models"]
+    label_parts = []
+    if threshold_value is not None:
+        label_parts.append(f"Mel review {threshold_value:.2f}")
+    if policy["selection_basis"]:
+        label_parts.append(str(policy["selection_basis"]))
+    policy["label"] = " | ".join(label_parts) if label_parts else "Default threshold only"
+    return policy
+
+
+def _annotate_threshold_policy(safety, model_key):
+    policy = _build_threshold_policy(model_key)
+    safety["threshold_policy"] = policy
+    threshold_value = policy.get("melanoma_safe_threshold")
+    if threshold_value is None:
+        return safety
+
+    melanoma_probability = float(safety.get("melanoma_probability", 0.0))
+    threshold_triggered = melanoma_probability >= float(threshold_value)
+    safety["threshold_policy"]["threshold_triggered"] = threshold_triggered
+    if threshold_triggered and safety.get("raw_prediction") != "Melanoma":
+        reasons = list(safety.get("reasons", []))
+        trigger_reason = "Melanoma probability crossed the tuned review threshold"
+        if trigger_reason not in reasons:
+            reasons.append(trigger_reason)
+        safety["reasons"] = reasons
+        safety["threshold_policy"]["review_signal"] = True
+    else:
+        safety["threshold_policy"]["review_signal"] = False
+    return safety
+
+
+def _normalize_embedding(vec):
+    arr = np.asarray(vec, dtype=np.float32).reshape(-1)
+    norm = float(np.linalg.norm(arr))
+    if norm <= 1e-8:
+        return arr
+    return arr / norm
+
+
+def _softmax_from_scaled_probs(probabilities, temperature):
+    probs = np.asarray(probabilities, dtype=np.float32)
+    probs = np.clip(probs, 1e-8, 1.0)
+    logits = np.log(probs)
+    scaled = logits / max(float(temperature), 1e-4)
+    scaled -= scaled.max()
+    exp_scaled = np.exp(scaled)
+    return exp_scaled / exp_scaled.sum()
+
+
+def _get_calibration_entry(model_key):
+    registry = _load_phase2_registry(PHASE2_CALIBRATION_PATH)
+    return registry.get(model_key)
+
+
+def _apply_probability_calibration(probabilities, model_key):
+    entry = _get_calibration_entry(model_key) or {}
+    temperature = float(entry.get("temperature", cfg.DEFAULT_TEMPERATURE))
+    calibrated = _softmax_from_scaled_probs(probabilities, temperature)
+    meta = {
+        "available": bool(entry),
+        "method": entry.get("method", "temperature_scaling" if entry else "none"),
+        "temperature": round(temperature, 4),
+        "ece_before": entry.get("ece_before"),
+        "ece_after": entry.get("ece_after"),
+        "mce_before": entry.get("mce_before"),
+        "mce_after": entry.get("mce_after"),
+        "source_run": entry.get("source_run"),
+        "source_csv": entry.get("source_csv"),
+    }
+    return calibrated, meta
+
+
+def _get_ood_entry(model_key):
+    registry = _load_phase2_registry(PHASE2_OOD_PATH)
+    return registry.get(model_key)
+
+
+def _estimate_ood_from_embedding(bag_embedding, model_key):
+    entry = _get_ood_entry(model_key) or {}
+    if bag_embedding is None or not entry:
+        return {
+            "available": False,
+            "ood_score": None,
+            "ood_flag": False,
+            "ood_level": "unavailable",
+            "nearest_class": None,
+            "nearest_distance": None,
+            "normalized_distance": None,
+            "id_support_score": None,
+        }
+
+    embedding = np.asarray(bag_embedding, dtype=np.float32)
+    centroids = entry.get("class_centroids", {})
+    thresholds = entry.get("class_thresholds", {})
+    if not centroids:
+        return {
+            "available": False,
+            "ood_score": None,
+            "ood_flag": False,
+            "ood_level": "unavailable",
+            "nearest_class": None,
+            "nearest_distance": None,
+            "normalized_distance": None,
+            "id_support_score": None,
+        }
+
+    distances = {}
+    normalized = {}
+    for class_name, centroid in centroids.items():
+        centroid_np = np.asarray(centroid, dtype=np.float32)
+        dist = float(np.linalg.norm(embedding - centroid_np))
+        threshold = max(float(thresholds.get(class_name, 1.0)), 1e-6)
+        distances[class_name] = dist
+        normalized[class_name] = dist / threshold
+
+    nearest_class = min(normalized, key=normalized.get)
+    nearest_distance = distances[nearest_class]
+    normalized_distance = float(normalized[nearest_class])
+    ood_score = float(np.clip((normalized_distance - 1.0) / 0.8, 0.0, 1.0))
+    id_support = float(np.clip(1.0 - ood_score, 0.0, 1.0))
+
+    if normalized_distance >= cfg.OOD_STRONG_THRESHOLD:
+        ood_level = "strong"
+        ood_flag = True
+    elif normalized_distance >= cfg.OOD_MODERATE_THRESHOLD:
+        ood_level = "moderate"
+        ood_flag = False
+    else:
+        ood_level = "low"
+        ood_flag = False
+
+    return {
+        "available": True,
+        "ood_score": round(ood_score, 4),
+        "ood_flag": ood_flag,
+        "ood_level": ood_level,
+        "nearest_class": nearest_class,
+        "nearest_distance": round(nearest_distance, 4),
+        "normalized_distance": round(normalized_distance, 4),
+        "id_support_score": round(id_support, 4),
+    }
+
+
+def _merge_phase2_safety(phase1_safety, probabilities, model_key, bag_embedding, calibration_meta, raw_probabilities=None):
+    safety = dict(phase1_safety)
+    probs = np.asarray(probabilities, dtype=np.float32)
+    raw_probs = np.asarray(raw_probabilities, dtype=np.float32) if raw_probabilities is not None else probs
+    ood = _estimate_ood_from_embedding(bag_embedding, model_key)
+    disagreement = safety.get("ensemble_disagreement")
+
+    components = [
+        float(safety.get("uncertainty", 0.0)),
+        float(np.clip(1.0 - safety.get("margin", 0.0), 0.0, 1.0)),
+        float(ood["ood_score"]) if ood["ood_score"] is not None else 0.0,
+    ]
+    if disagreement is not None:
+        components.append(float(disagreement))
+    unified_safety_score = float(np.mean(components))
+
+    reasons = list(safety.get("reasons", []))
+    if ood["available"] and ood["ood_level"] == "moderate":
+        reasons.append(f"Moderate OOD shift toward {ood['nearest_class']}")
+    if ood["ood_flag"]:
+        reasons.append(f"Strong OOD signal beyond {ood['nearest_class']}")
+
+    if ood["ood_flag"]:
+        safety["display_prediction"] = "Needs Expert Review"
+        safety["decision_status"] = "abstain"
+        safety["prediction_key"] = "abstain"
+        safety["abstain_recommended"] = True
+        safety["risk_level"] = "urgent review recommended"
+        safety["recommendation"] = "Potential out-of-distribution case detected; defer to expert review."
+    elif unified_safety_score >= cfg.UNIFIED_SAFETY_HIGH and safety.get("risk_level") != "urgent review recommended":
+        safety["risk_level"] = "high risk"
+    elif unified_safety_score >= cfg.UNIFIED_SAFETY_MODERATE and safety.get("risk_level") == "low risk":
+        safety["risk_level"] = "moderate risk"
+
+    safety["reasons"] = reasons
+    safety["phase"] = "phase2"
+    safety["raw_probabilities"] = {
+        CLASS_NAMES[i]: round(float(raw_probs[i]), 4)
+        for i in range(N_CLASSES)
+    }
+    safety["calibration"] = {
+        "available": bool(calibration_meta),
+        "method": calibration_meta.get("method", "temperature_scaling" if calibration_meta else "none"),
+        "temperature": round(float(calibration_meta.get("temperature", cfg.DEFAULT_TEMPERATURE)), 4),
+        "ece_before": calibration_meta.get("ece_before"),
+        "ece_after": calibration_meta.get("ece_after"),
+        "mce_before": calibration_meta.get("mce_before"),
+        "mce_after": calibration_meta.get("mce_after"),
+        "source_run": calibration_meta.get("source_run"),
+        "source_csv": calibration_meta.get("source_csv"),
+    }
+    safety["ood"] = ood
+    safety["unified_safety_score"] = round(unified_safety_score, 4)
+    safety["safety_score"] = round(unified_safety_score, 4)
+    safety["id_support_score"] = ood["id_support_score"]
+    return safety
+
+
+def _merge_phase2_ensemble_safety(phase1_safety, probabilities, model_keys, bag_embeddings, calibration_metas, raw_probabilities=None):
+    safety = dict(phase1_safety)
+    per_model_ood = []
+    for mkey, emb in zip(model_keys, bag_embeddings):
+        per_model_ood.append({
+            "model_key": mkey,
+            "model_display": MODEL_REGISTRY.get(mkey, {}).get("display", mkey),
+            **_estimate_ood_from_embedding(emb, mkey),
+        })
+
+    available_ood = [x for x in per_model_ood if x.get("available")]
+    if available_ood:
+        ood_score = float(np.mean([x["ood_score"] for x in available_ood if x["ood_score"] is not None]))
+        id_support = float(np.mean([x["id_support_score"] for x in available_ood if x["id_support_score"] is not None]))
+        strongest = max(available_ood, key=lambda x: x["ood_score"])
+        ood_flag = any(x["ood_flag"] for x in available_ood)
+        ood_level = "strong" if ood_flag else ("moderate" if any(x["ood_level"] == "moderate" for x in available_ood) else "low")
+        ood = {
+            "available": True,
+            "ood_score": round(ood_score, 4),
+            "ood_flag": ood_flag,
+            "ood_level": ood_level,
+            "nearest_class": strongest.get("nearest_class"),
+            "nearest_distance": strongest.get("nearest_distance"),
+            "normalized_distance": strongest.get("normalized_distance"),
+            "id_support_score": round(id_support, 4),
+            "per_model": per_model_ood,
+        }
+    else:
+        ood = {
+            "available": False,
+            "ood_score": None,
+            "ood_flag": False,
+            "ood_level": "unavailable",
+            "nearest_class": None,
+            "nearest_distance": None,
+            "normalized_distance": None,
+            "id_support_score": None,
+            "per_model": per_model_ood,
+        }
+
+    disagreement = safety.get("ensemble_disagreement")
+    components = [
+        float(safety.get("uncertainty", 0.0)),
+        float(np.clip(1.0 - safety.get("margin", 0.0), 0.0, 1.0)),
+        float(ood["ood_score"]) if ood["ood_score"] is not None else 0.0,
+    ]
+    if disagreement is not None:
+        components.append(float(disagreement))
+    unified_safety_score = float(np.mean(components))
+
+    reasons = list(safety.get("reasons", []))
+    if ood["available"] and ood["ood_level"] == "moderate":
+        reasons.append(f"Moderate ensemble OOD shift toward {ood['nearest_class']}")
+    if ood["ood_flag"]:
+        reasons.append(f"Strong ensemble OOD signal beyond {ood['nearest_class']}")
+
+    if ood["ood_flag"]:
+        safety["display_prediction"] = "Needs Expert Review"
+        safety["decision_status"] = "abstain"
+        safety["prediction_key"] = "abstain"
+        safety["abstain_recommended"] = True
+        safety["risk_level"] = "urgent review recommended"
+        safety["recommendation"] = "Potential out-of-distribution ensemble case detected; defer to expert review."
+    elif unified_safety_score >= cfg.UNIFIED_SAFETY_HIGH and safety.get("risk_level") != "urgent review recommended":
+        safety["risk_level"] = "high risk"
+    elif unified_safety_score >= cfg.UNIFIED_SAFETY_MODERATE and safety.get("risk_level") == "low risk":
+        safety["risk_level"] = "moderate risk"
+
+    probs = np.asarray(probabilities, dtype=np.float32)
+    raw_probs = np.asarray(raw_probabilities, dtype=np.float32) if raw_probabilities is not None else probs
+    safety["reasons"] = reasons
+    safety["phase"] = "phase2"
+    safety["raw_probabilities"] = {
+        CLASS_NAMES[i]: round(float(raw_probs[i]), 4)
+        for i in range(N_CLASSES)
+    }
+    safety["calibration"] = {
+        "available": any(meta.get("available") for meta in calibration_metas),
+        "method": "per-model temperature scaling",
+        "ensemble": calibration_metas,
+    }
+    safety["ood"] = ood
+    safety["unified_safety_score"] = round(unified_safety_score, 4)
+    safety["safety_score"] = round(unified_safety_score, 4)
+    safety["id_support_score"] = ood["id_support_score"]
+    return safety
+
+
+def _build_retrieval_query_embedding(model_key, bag_embedding=None, ensemble_model_keys=None, ensemble_bag_embeddings=None):
+    if model_key in ENSEMBLE_PRESETS:
+        component_models = ENSEMBLE_PRESETS[model_key]["models"]
+        if not ensemble_model_keys or not ensemble_bag_embeddings:
+            return None
+        by_model = {
+            mkey: _normalize_embedding(emb)
+            for mkey, emb in zip(ensemble_model_keys, ensemble_bag_embeddings)
+            if emb is not None
+        }
+        if not all(mkey in by_model for mkey in component_models):
+            return None
+        return _normalize_embedding(np.concatenate([by_model[mkey] for mkey in component_models], axis=0))
+
+    if bag_embedding is None:
+        return None
+    return _normalize_embedding(bag_embedding)
+
+
+def _format_retrieval_case(case_meta, similarity):
+    return {
+        "slide_id": case_meta["slide_id"],
+        "filename": case_meta.get("filename"),
+        "true_label": case_meta.get("true_label"),
+        "source": case_meta.get("source"),
+        "similarity": round(float(similarity), 4),
+        "thumbnail_url": case_meta.get("thumbnail_url"),
+        "is_hard_melanoma": bool(case_meta.get("is_hard_melanoma")),
+    }
+
+
+def _retrieve_similar_cases(model_key, bag_embedding=None, ensemble_model_keys=None, ensemble_bag_embeddings=None, top_k=5, hard_top_k=3):
+    registry, arrays = _load_phase4_registry()
+    banks = registry.get("banks", {})
+    bank = banks.get(model_key)
+    if not bank:
+        return {
+            "available": False,
+            "bank_key": model_key,
+            "similar_cases": [],
+            "hard_melanoma_matches": [],
+        }
+
+    embeddings = arrays.get(model_key)
+    if embeddings is None or not len(embeddings):
+        return {
+            "available": False,
+            "bank_key": model_key,
+            "similar_cases": [],
+            "hard_melanoma_matches": [],
+        }
+
+    query = _build_retrieval_query_embedding(
+        model_key,
+        bag_embedding=bag_embedding,
+        ensemble_model_keys=ensemble_model_keys,
+        ensemble_bag_embeddings=ensemble_bag_embeddings,
+    )
+    if query is None or query.shape[0] != embeddings.shape[1]:
+        return {
+            "available": False,
+            "bank_key": model_key,
+            "similar_cases": [],
+            "hard_melanoma_matches": [],
+        }
+
+    case_lookup = registry.get("cases", {})
+    case_ids = bank.get("case_ids", [])
+    scores = embeddings @ query
+    order = np.argsort(scores)[::-1]
+
+    similar_cases = []
+    hard_cases = []
+    for idx in order:
+        if idx >= len(case_ids):
+            continue
+        slide_id = case_ids[idx]
+        case_meta = case_lookup.get(slide_id)
+        if not case_meta:
+            continue
+        item = _format_retrieval_case(case_meta, scores[idx])
+        if len(similar_cases) < top_k:
+            similar_cases.append(item)
+        if item["is_hard_melanoma"] and len(hard_cases) < hard_top_k:
+            hard_cases.append(item)
+        if len(similar_cases) >= top_k and len(hard_cases) >= hard_top_k:
+            break
+
+    return {
+        "available": True,
+        "bank_key": model_key,
+        "bank_display": bank.get("display", model_key),
+        "bank_type": bank.get("type", "single_model"),
+        "bank_size": int(bank.get("n_cases", len(case_ids))),
+        "hard_case_count": int(bank.get("hard_case_count", 0)),
+        "similar_cases": similar_cases,
+        "hard_melanoma_matches": hard_cases,
+    }
+
+
+def _get_retrieval_case_meta(slide_id):
+    registry, _ = _load_phase4_registry()
+    return (registry.get("cases") or {}).get(slide_id)
+
+
+def _comparison_job_id(slide_id, model_key):
+    safe_model = "".join(ch if ch.isalnum() else "_" for ch in model_key)[:32]
+    return f"retrcmp_{slide_id[:12]}_{safe_model}"
+
+
+def _build_result_artifacts(job_id, result):
+    views = result.get("heatmap_views") or []
+    overlay_urls = {}
+    mask_urls = {}
+    for view in views:
+        key = view["key"]
+        if key in ("attention", "default"):
+            overlay_urls[key] = f"/api/results/{job_id}/heatmap"
+            mask_urls[key] = f"/api/results/{job_id}/heatmap_only"
+        else:
+            overlay_urls[key] = f"/api/results/{job_id}/heatmap/{key}"
+            mask_urls[key] = f"/api/results/{job_id}/heatmap_only/{key}"
+    return {
+        "thumbnail_url": f"/api/results/{job_id}/thumbnail",
+        "heatmap_overlay_urls": overlay_urls,
+        "heatmap_mask_urls": mask_urls,
+        "tile_base_url": f"/api/results/{job_id}/tiles",
+        "export_url": f"/api/results/{job_id}/export",
+    }
+
+
+def _build_phase1_safety(prediction, probabilities, ensemble_predictions=None):
+    probs = np.asarray(probabilities, dtype=np.float32)
+    order = np.argsort(probs)[::-1]
+    top1 = float(probs[order[0]])
+    top2 = float(probs[order[1]]) if len(order) > 1 else 0.0
+    margin = top1 - top2
+    entropy_norm = _normalized_entropy(probs)
+    melanoma_prob = float(probs[3])
+    raw_prediction = CLASS_NAMES[int(prediction)]
+
+    disagreement = None
+    if ensemble_predictions:
+        votes = [int(v) for v in ensemble_predictions]
+        if votes:
+            majority_votes = max(votes.count(v) for v in set(votes))
+            disagreement = float(1.0 - (majority_votes / len(votes)))
+
+    reasons = []
+    if top1 < cfg.ABSTAIN_CONFIDENCE_THRESHOLD:
+        reasons.append('Low top-class confidence')
+    if entropy_norm >= cfg.HIGH_UNCERTAINTY_THRESHOLD:
+        reasons.append('High predictive uncertainty')
+    if margin < cfg.LOW_MARGIN_THRESHOLD:
+        reasons.append('Narrow margin between top classes')
+    if disagreement is not None and disagreement >= cfg.ENSEMBLE_DISAGREEMENT_THRESHOLD:
+        reasons.append('High ensemble disagreement')
+
+    melanoma_first_guard = raw_prediction != 'Melanoma' and melanoma_prob >= cfg.MELANOMA_BORDERLINE_PROB
+    if melanoma_first_guard:
+        reasons.append('Melanoma-first safeguard triggered')
+
+    abstain_recommended = bool(
+        melanoma_first_guard and (
+            top1 < 0.75 or
+            entropy_norm >= cfg.MODERATE_UNCERTAINTY_THRESHOLD or
+            margin < 0.22 or
+            (disagreement is not None and disagreement >= cfg.ENSEMBLE_DISAGREEMENT_THRESHOLD)
+        )
+    )
+
+    if abstain_recommended:
+        risk_level = 'urgent review recommended'
+        recommendation = 'Do not finalize diagnosis automatically; send for expert review.'
+        display_prediction = 'Needs Expert Review'
+        decision_status = 'abstain'
+        prediction_key = 'abstain'
+    elif raw_prediction == 'Melanoma' or melanoma_prob >= cfg.MELANOMA_HIGH_RISK_PROB:
+        risk_level = 'high risk'
+        recommendation = 'Melanoma-sensitive review recommended.'
+        display_prediction = raw_prediction
+        decision_status = 'predicted'
+        prediction_key = CLASS_KEYS[int(prediction)]
+    elif reasons:
+        risk_level = 'moderate risk'
+        recommendation = 'Prediction available, but review caution flags before final use.'
+        display_prediction = raw_prediction
+        decision_status = 'predicted'
+        prediction_key = CLASS_KEYS[int(prediction)]
+    else:
+        risk_level = 'low risk'
+        recommendation = 'No Phase 1 safety warning triggered.'
+        display_prediction = raw_prediction
+        decision_status = 'predicted'
+        prediction_key = CLASS_KEYS[int(prediction)]
+
+    return {
+        'raw_prediction': raw_prediction,
+        'display_prediction': display_prediction,
+        'decision_status': decision_status,
+        'prediction_key': prediction_key,
+        'confidence': round(top1, 4),
+        'margin': round(margin, 4),
+        'uncertainty': round(entropy_norm, 4),
+        'melanoma_probability': round(melanoma_prob, 4),
+        'ensemble_disagreement': None if disagreement is None else round(disagreement, 4),
+        'melanoma_first_guard': melanoma_first_guard,
+        'abstain_recommended': abstain_recommended,
+        'risk_level': risk_level,
+        'recommendation': recommendation,
+        'reasons': reasons,
+        'hard_case_candidate': bool(melanoma_first_guard or (raw_prediction == 'Melanoma' and top1 < 0.75)),
+    }
+
+
+def _record_phase1_inference_case(job_id, slide_path, model_key, model_display, slide_info, result):
+    safety = result.get('safety') or {}
+    if not (safety.get('hard_case_candidate') or safety.get('abstain_recommended')):
+        return
+
+    record = {
+        'job_id': job_id,
+        'timestamp': result.get('timestamp'),
+        'slide_path': slide_path,
+        'filename': Path(slide_path).name,
+        'model_key': model_key,
+        'model_display': model_display,
+        'prediction': result.get('prediction'),
+        'raw_prediction': result.get('raw_prediction'),
+        'prediction_key': result.get('prediction_key'),
+        'decision_status': result.get('decision_status'),
+        'probabilities': result.get('probabilities'),
+        'safety': safety,
+        'slide_info': slide_info,
+    }
+
+    case_dir = PHASE1_BANK_DIR / 'inference_cases'
+    case_dir.mkdir(parents=True, exist_ok=True)
+    case_path = case_dir / f'{job_id}.json'
+    with open(case_path, 'w', encoding='utf-8') as f:
+        json.dump(record, f, indent=2)
+
+    manifest_path = PHASE1_BANK_DIR / 'inference_candidates.jsonl'
+    with phase1_case_lock:
+        with open(manifest_path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(record) + "\n")
+
+
+# ??????????????????????????????????????????????????? Heatmap â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _make_clinical_colormap(n=256):
     cmap = np.zeros((n, 3), dtype=np.float32)
@@ -817,7 +1751,22 @@ def _make_clinical_colormap(n=256):
     return cmap
 
 
-def _generate_heatmap(slide, tile_coords, attention_weights, probabilities, job_id):
+def _heatmap_asset_paths(job_id, variant="attention"):
+    out_dir = RESULTS_DIR / job_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if variant in ("attention", "default", None):
+        return out_dir / "heatmap.jpg", out_dir / "heatmap_only.png", out_dir / "thumbnail.jpg"
+
+    safe_variant = variant.replace("/", "_").replace("\\", "_")
+    return (
+        out_dir / f"{safe_variant}_heatmap.jpg",
+        out_dir / f"{safe_variant}_heatmap_only.png",
+        out_dir / "thumbnail.jpg",
+    )
+
+
+def _generate_heatmap(slide, tile_coords, attention_weights, probabilities, job_id, variant="attention"):
     import cv2
     try:
         use_level = slide.level_count - 1
@@ -877,21 +1826,18 @@ def _generate_heatmap(slide, tile_coords, attention_weights, probabilities, job_
         overlay = np.clip((1 - alpha_3ch) * thumb_np + alpha_3ch * heat_color, 0, 1)
         overlay_u8 = (overlay * 255).astype(np.uint8)
 
-        out_dir = RESULTS_DIR / job_id
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        Image.fromarray(overlay_u8).save(str(out_dir / "heatmap.jpg"), quality=90)
-        Image.fromarray((thumb_np * 255).astype(np.uint8)).save(
-            str(out_dir / "thumbnail.jpg"), quality=90)
+        overlay_path, heat_only_path, thumb_path = _heatmap_asset_paths(job_id, variant)
+        Image.fromarray(overlay_u8).save(str(overlay_path), quality=90)
+        Image.fromarray((thumb_np * 255).astype(np.uint8)).save(str(thumb_path), quality=90)
 
         heat_rgba = np.zeros((hL, wL, 4), dtype=np.uint8)
         heat_rgba[:, :, :3] = (heat_color * 255).astype(np.uint8)
         visible_alpha = np.clip(heat_norm * 200, 0, 200).astype(np.uint8)
         heat_rgba[:, :, 3] = visible_alpha
-        Image.fromarray(heat_rgba).save(str(out_dir / "heatmap_only.png"))
+        Image.fromarray(heat_rgba).save(str(heat_only_path))
 
-        logger.info(f"Heatmap saved for {job_id} ({wL}Ã—{hL})")
-        return str(out_dir / "heatmap.jpg")
+        logger.info(f"Heatmap saved for {job_id} [{variant}] ({wL}Ã—{hL})")
+        return str(overlay_path)
 
     except Exception as e:
         logger.exception(f"Heatmap generation failed: {e}")
@@ -911,6 +1857,25 @@ def _get_top_attention_tiles(tiles, tile_coords, attention_weights, job_id, top_
                 "image_url": f"/api/results/{job_id}/tiles/tile_{idx:04d}.jpg",
             })
     return top_tiles
+
+
+def _annotate_top_tiles(base_tiles, extra_fields):
+    extra_fields = extra_fields or {}
+    out = []
+    for tile in base_tiles:
+        tile_copy = dict(tile)
+        idx = tile_copy.get("tile_index")
+        for key, values in extra_fields.items():
+            if values is None or idx is None or idx >= len(values):
+                continue
+            tile_copy[key] = round(float(values[idx]), 6)
+        out.append(tile_copy)
+    return out
+
+
+def _default_heatmap_views(is_ensemble):
+    base_keys = ["consensus", "disagreement", "shared"] if is_ensemble else ["attention"]
+    return _build_heatmap_view_list(base_keys)
 
 
 def _update_job(job_id, **kwargs):
@@ -943,6 +1908,7 @@ def list_models():
     models = []
     for key, mcfg in MODEL_REGISTRY.items():
         ckpt_exists = Path(mcfg["mil_checkpoint"]).exists()
+        threshold_policy = _build_threshold_policy(key)
         models.append({
             "key": key,
             "name": mcfg["name"],
@@ -953,6 +1919,8 @@ def list_models():
             "mel_fn": mcfg.get("mel_fn", "?"),
             "description": mcfg["description"],
             "available": ckpt_exists,
+            "threshold_policy": threshold_policy,
+            "threshold_label": threshold_policy.get("label"),
         })
     # Sort by F1 descending
     models.sort(key=lambda x: x["f1"], reverse=True)
@@ -960,6 +1928,7 @@ def list_models():
     # Ensemble presets
     ensembles = []
     for ekey, ecfg in ENSEMBLE_PRESETS.items():
+        threshold_policy = _build_threshold_policy(ekey)
         ensembles.append({
             "key": ekey,
             "name": ecfg["name"],
@@ -969,6 +1938,8 @@ def list_models():
             "f1": ecfg["f1"],
             "auc": ecfg["auc"],
             "mel_fn": 0,
+            "threshold_policy": threshold_policy,
+            "threshold_label": threshold_policy.get("label"),
         })
 
     return jsonify({
@@ -1110,10 +2081,24 @@ def serve_heatmap(job_id):
     if not p.exists(): abort(404)
     return send_file(str(p), mimetype="image/jpeg")
 
+@app.route("/api/results/<job_id>/heatmap/<variant>")
+def serve_heatmap_variant(job_id, variant):
+    p, _, _ = _heatmap_asset_paths(job_id, variant)
+    if not p.exists():
+        abort(404)
+    return send_file(str(p), mimetype="image/jpeg")
+
 @app.route("/api/results/<job_id>/heatmap_only")
 def serve_heatmap_only(job_id):
     p = RESULTS_DIR / job_id / "heatmap_only.png"
     if not p.exists(): abort(404)
+    return send_file(str(p), mimetype="image/png")
+
+@app.route("/api/results/<job_id>/heatmap_only/<variant>")
+def serve_heatmap_only_variant(job_id, variant):
+    _, p, _ = _heatmap_asset_paths(job_id, variant)
+    if not p.exists():
+        abort(404)
     return send_file(str(p), mimetype="image/png")
 
 @app.route("/api/results/<job_id>/thumbnail")
@@ -1127,6 +2112,71 @@ def serve_tile(job_id, filename):
     p = RESULTS_DIR / job_id / "tiles" / filename
     if not p.exists(): abort(404)
     return send_file(str(p), mimetype="image/jpeg")
+
+
+@app.route("/api/retrieval/thumbnails/<slide_id>.jpg")
+def serve_retrieval_thumbnail(slide_id):
+    p = PHASE4_THUMB_DIR / f"{slide_id}.jpg"
+    if not p.exists():
+        abort(404)
+    return send_file(str(p), mimetype="image/jpeg")
+
+
+@app.route("/api/retrieval/cases/<slide_id>/compare")
+def compare_retrieval_case(slide_id):
+    case_meta = _get_retrieval_case_meta(slide_id)
+    if not case_meta:
+        return jsonify({"error": "Retrieval case not found"}), 404
+
+    model_key = request.args.get("model", "ensemble_3_best")
+    if model_key not in ENSEMBLE_PRESETS and model_key not in MODEL_REGISTRY:
+        model_key = "ensemble_3_best"
+    if model_key in ENSEMBLE_PRESETS:
+        model_display = ENSEMBLE_PRESETS[model_key]["display"]
+    else:
+        model_display = MODEL_REGISTRY[model_key]["display"]
+
+    job_id = _comparison_job_id(slide_id, model_key)
+    with analyses_lock:
+        job = analyses.get(job_id)
+
+    if not job or job.get("slide_path") != case_meta["slide_path"] or not job.get("result"):
+        with analyses_lock:
+            analyses[job_id] = {
+                "status": "queued",
+                "progress": 0,
+                "message": "Queued for retrieval comparison.",
+                "filename": case_meta["filename"],
+                "slide_path": case_meta["slide_path"],
+                "model_key": model_key,
+                "model_display": model_display,
+                "created_at": datetime.now().isoformat(),
+                "result": None,
+            }
+        run_analysis(job_id, case_meta["slide_path"], model_key)
+        with analyses_lock:
+            job = analyses.get(job_id)
+
+    if not job or job.get("status") != "completed" or not job.get("result"):
+        return jsonify({
+            "error": "Comparison analysis failed",
+            "status": (job or {}).get("status", "error"),
+            "message": (job or {}).get("message", "Unknown error"),
+        }), 500
+
+    result = dict(job["result"])
+    result.setdefault("artifacts", _build_result_artifacts(job_id, result))
+    return jsonify({
+        "job_id": job_id,
+        "filename": case_meta["filename"],
+        "slide_id": slide_id,
+        "true_label": case_meta.get("true_label"),
+        "source": case_meta.get("source"),
+        "is_hard_melanoma": bool(case_meta.get("is_hard_melanoma")),
+        "model_key": model_key,
+        "model_display": model_display,
+        "result": result,
+    })
 
 
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€ History & Export â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -1162,8 +2212,25 @@ def export_results(job_id):
         "filename": job.get("filename"),
         "analysis_date": job.get("created_at"),
         "model": job.get("model_display"),
+        "model_key": job.get("model_key"),
         "result": job["result"],
         "slide_info": job.get("slide_info"),
+        "decision_policy": {
+            "abstain_confidence_threshold": cfg.ABSTAIN_CONFIDENCE_THRESHOLD,
+            "high_uncertainty_threshold": cfg.HIGH_UNCERTAINTY_THRESHOLD,
+            "moderate_uncertainty_threshold": cfg.MODERATE_UNCERTAINTY_THRESHOLD,
+            "low_margin_threshold": cfg.LOW_MARGIN_THRESHOLD,
+            "melanoma_borderline_probability": cfg.MELANOMA_BORDERLINE_PROB,
+            "melanoma_high_risk_probability": cfg.MELANOMA_HIGH_RISK_PROB,
+            "ensemble_disagreement_threshold": cfg.ENSEMBLE_DISAGREEMENT_THRESHOLD,
+            "ood_strong_threshold": cfg.OOD_STRONG_THRESHOLD,
+            "ood_moderate_threshold": cfg.OOD_MODERATE_THRESHOLD,
+            "unified_safety_high": cfg.UNIFIED_SAFETY_HIGH,
+            "unified_safety_moderate": cfg.UNIFIED_SAFETY_MODERATE,
+        },
+        "threshold_policy": (job["result"].get("threshold_policy") or _build_threshold_policy(job.get("model_key"))),
+        "artifacts": job["result"].get("artifacts") or _build_result_artifacts(job_id, job["result"]),
+        "retrieval_summary": (job["result"].get("retrieval") or {}),
     }
 
     export_path = RESULTS_DIR / job_id / "export.json"
@@ -1196,6 +2263,15 @@ def server_info():
     results_size = sum(f.stat().st_size for f in RESULTS_DIR.rglob("*") if f.is_file())
     with analyses_lock:
         n_jobs = len(analyses)
+    retrieval_registry, _ = _load_phase4_registry()
+    threshold_registry = _get_threshold_registry()
+    threshold_count = 0
+    if isinstance(threshold_registry, dict):
+        if "models" in threshold_registry or "ensembles" in threshold_registry:
+            threshold_count += len(threshold_registry.get("models", {}))
+            threshold_count += len(threshold_registry.get("ensembles", {}))
+        else:
+            threshold_count = len(threshold_registry)
     return jsonify({
         "status": "ok",
         "jobs": n_jobs,
@@ -1203,6 +2279,9 @@ def server_info():
         "results_mb": round(results_size / 1e6, 1),
         "n_models": len(MODEL_REGISTRY),
         "classes": list(CLASS_NAMES.values()),
+        "retrieval_banks": sorted((retrieval_registry.get("banks") or {}).keys()),
+        "phase0_threshold_registry_loaded": bool(threshold_count),
+        "phase0_threshold_entries": threshold_count,
     })
 
 

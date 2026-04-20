@@ -60,6 +60,7 @@
                     </select>
                     <div class="model-info" id="model-info">
                         <span class="model-f1" id="model-f1"></span>
+                        <span class="model-threshold" id="model-threshold"></span>
                         <span class="model-desc" id="model-desc"></span>
                     </div>
                 </div>
@@ -98,6 +99,55 @@
                     <div class="prediction-label-small">Diagnosis</div>
                     <div class="prediction-value" id="prediction-value">—</div>
                     <div class="prediction-confidence" id="prediction-confidence"></div>
+                </div>
+
+                <div class="safety-panel" id="safety-panel" style="display:none;">
+                    <div class="section-title" style="margin-top:0;">Phase 1-2 Safety Layer</div>
+                    <div class="safety-badges">
+                        <span class="safety-badge risk-low" id="safety-risk-badge">Low Risk</span>
+                        <span class="safety-badge abstain-off" id="safety-abstain-badge">No Abstain</span>
+                        <span class="safety-badge risk-low" id="safety-ood-badge">OOD Low</span>
+                    </div>
+                    <div class="safety-summary" id="safety-summary">No safety summary yet.</div>
+                    <div class="safety-grid">
+                        <div class="safety-metric-card">
+                            <div class="safety-metric-label">Uncertainty</div>
+                            <div class="safety-metric-value" id="safety-uncertainty">-</div>
+                        </div>
+                        <div class="safety-metric-card">
+                            <div class="safety-metric-label">Margin</div>
+                            <div class="safety-metric-value" id="safety-margin">-</div>
+                        </div>
+                        <div class="safety-metric-card">
+                            <div class="safety-metric-label">Melanoma Prob.</div>
+                            <div class="safety-metric-value" id="safety-melanoma-prob">-</div>
+                        </div>
+                        <div class="safety-metric-card">
+                            <div class="safety-metric-label">Disagreement</div>
+                            <div class="safety-metric-value" id="safety-disagreement">-</div>
+                        </div>
+                        <div class="safety-metric-card">
+                            <div class="safety-metric-label">OOD Score</div>
+                            <div class="safety-metric-value" id="safety-ood-score">-</div>
+                        </div>
+                        <div class="safety-metric-card">
+                            <div class="safety-metric-label">ID Support</div>
+                            <div class="safety-metric-value" id="safety-id-support">-</div>
+                        </div>
+                        <div class="safety-metric-card">
+                            <div class="safety-metric-label">Safety Score</div>
+                            <div class="safety-metric-value" id="safety-score">-</div>
+                        </div>
+                        <div class="safety-metric-card">
+                            <div class="safety-metric-label">Calibration</div>
+                            <div class="safety-metric-value" id="safety-calibration">-</div>
+                        </div>
+                        <div class="safety-metric-card">
+                            <div class="safety-metric-label">Threshold Policy</div>
+                            <div class="safety-metric-value" id="safety-threshold">-</div>
+                        </div>
+                    </div>
+                    <div class="safety-flags" id="safety-flags"></div>
                 </div>
 
                 <!-- Probability Bars (4 classes) -->
@@ -153,18 +203,31 @@
                 <!-- Heatmap Toggle -->
                 <div class="toggle-group" id="heatmap-toggle-group">
                     <div class="toggle-label-text">
-                        <span>🔥</span> Attention Heatmap
+                        <span>🔥</span> Heatmap Overlay
                     </div>
                     <label class="toggle-switch">
                         <input type="checkbox" id="heatmap-toggle" onchange="toggleHeatmap(this.checked)">
                         <span class="toggle-slider"></span>
                     </label>
                 </div>
+                <div class="heatmap-view-controls" id="heatmap-view-controls" style="display:none;">
+                    <div class="heatmap-view-label">Heatmap View</div>
+                    <div class="heatmap-view-buttons" id="heatmap-view-buttons"></div>
+                </div>
 
                 <!-- Top Attention Tiles -->
-                <div class="section-title" style="margin-top: 8px;"><span class="icon">🏆</span> Top Attention Tiles</div>
+                <div class="section-title" style="margin-top: 8px;"><span class="icon">🏆</span> <span id="top-tiles-title">Top Attention Tiles</span></div>
                 <div class="top-tiles-grid" id="top-tiles-grid">
                     <!-- Filled dynamically -->
+                </div>
+
+                <div class="retrieval-panel" id="retrieval-panel" style="display:none;">
+                    <div class="section-title" style="margin-top: 10px;"><span class="icon">R</span> Similar Cases</div>
+                    <div class="retrieval-summary" id="retrieval-summary">No retrieval results yet.</div>
+                    <div class="retrieval-grid" id="retrieval-grid"></div>
+
+                    <div class="section-title retrieval-subtitle" id="hard-retrieval-title" style="display:none;">Hard Melanoma Matches</div>
+                    <div class="retrieval-grid compact" id="hard-retrieval-grid"></div>
                 </div>
             </div>
 
@@ -246,6 +309,16 @@
         <button class="btn btn-navigate" id="modal-nav-btn" style="display:none;" title="Navigate to this tile on the slide viewer">
             📍 View on Slide
         </button>
+    </div>
+</div>
+
+<div class="modal-backdrop" id="compare-modal" onclick="closeCompareModal(event)">
+    <div class="modal-content compare-modal-content" onclick="event.stopPropagation()">
+        <div class="modal-header">
+            <div class="modal-title" id="compare-modal-title">Similar Case Comparison</div>
+            <button class="modal-close" onclick="closeCompareModal()">&times;</button>
+        </div>
+        <div class="compare-modal-body" id="compare-modal-body"></div>
     </div>
 </div>
 

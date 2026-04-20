@@ -49,7 +49,8 @@ def load_slide_labels():
         reader = csv.DictReader(f)
         for row in reader:
             slide_id = row['slide_id']
-            label = 0 if row['true_label'].lower() == 'benign' else 1
+            label_name = row.get('true_label', row.get('label', 'benign'))
+            label = 0 if label_name.lower() == 'benign' else 1
             labels[slide_id] = label
     
     return labels
@@ -144,21 +145,22 @@ def main():
         reader = csv.DictReader(f)
         for row in reader:
             slide_id = row['slide_id']
-            true_labels[slide_id] = 0 if row['true_label'].lower() == 'benign' else 1
+            label_name = row.get('true_label', row.get('label', 'benign'))
+            true_labels[slide_id] = 0 if label_name.lower() == 'benign' else 1
             
             import ast
-            top_5_str = row['top_5_probs']
+            top_5_str = row.get('top_5_probs', '[]')
             try:
                 top_5_probs = ast.literal_eval(top_5_str)
             except:
                 top_5_probs = []
             
             slide_data[slide_id] = {
-                'mean_prob': float(row['mean_prob']),
-                'max_prob': float(row['max_prob']),
+                'mean_prob': float(row.get('mean_prob', row.get('slide_score_topk_mean', row.get('score', 0.0)))),
+                'max_prob': float(row.get('max_prob', row.get('mean_prob', row.get('slide_score_topk_mean', row.get('score', 0.0))))),
                 'top_5_probs': top_5_probs,
-                'score': float(row['score']),
-                'malignant_ratio': float(row['malignant_ratio'])
+                'score': float(row.get('score', row.get('mean_prob', row.get('slide_score_topk_mean', 0.0)))),
+                'malignant_ratio': float(row.get('malignant_ratio', 1.0 if float(row.get('mean_prob', row.get('slide_score_topk_mean', row.get('score', 0.0)))) >= 0.5 else 0.0))
             }
     
     print(f"Loaded {len(slide_data)} slides\n")

@@ -36,9 +36,6 @@ env/
 *.nav
 *.snm
 *.vrb
-*.tex
-*.bib
-*.sh
 # Windows Zone.Identifier files
 *Zone.Identifier
 *:Zone.Identifier
@@ -103,19 +100,21 @@ FINAL_REPORT.md
 reports/MERMAID_DIAGRAMS.md
 reports/PIPELINE_COMPLETE_REPORT.md
 
+# Report / documentation packages (keep architecture code, drop report assets)
+docs/
+reports/
+final_report/
+*.pdf
+*.tex
+*.bib
+*.md
+!README.md
+
 # GradCAM files (not used in final report)
 reports/figures/gradcam/
 reports/figures/gradcam_*.png
 
-# Template files
-graduation_project_interim_template.tex
-
-# Reference PDFs
-*.pdf
-
 *.sln
-
-reports/
 
 *.pt
 

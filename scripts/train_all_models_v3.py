@@ -134,8 +134,9 @@ EXPERIMENTS = [
 # GLOBAL CONFIG
 # ============================================================
 class Config:
+    project_root = Path(__file__).resolve().parents[1]
     data_root = Path("/mnt/d/skin_cancer_project/datasets")
-    base_output = Path("/home/byalc/phase1_project/results")
+    base_output = project_root / "results"
     cache_root = Path("/mnt/d/skin_cancer_project/cache")
     tile_dir = cache_root / "tiles_4class"
     base_feature_dir = cache_root
@@ -185,14 +186,40 @@ def setup_logging(log_file):
     return logging.getLogger(__name__)
 
 # ============================================================
+# PATH HELPERS
+# ============================================================
+def _first_existing_path(candidates, kind):
+    for p in candidates:
+        if p.exists():
+            return p
+    joined = "\n  - ".join(str(p) for p in candidates)
+    raise FileNotFoundError(f"Could not find {kind}. Checked:\n  - {joined}")
+
+
+# ============================================================
 # UNIFIED LABELS
 # ============================================================
 def create_unified_labels(cfg):
     logger = logging.getLogger(__name__)
     entries = []
 
+    label_roots = [
+        cfg.data_root / "labels",
+        cfg.project_root / "data" / "cobra",
+        cfg.project_root / "data" / "cobra_fresh",
+    ]
+    bcc_csv = _first_existing_path([
+        root / "bcc_bcc.csv" for root in label_roots
+    ], "BCC label CSV")
+    ood_csv = _first_existing_path([
+        root / "ood_disease_types.csv" for root in label_roots
+    ] + [
+        root / "ood_labels" / "ood_disease_types.csv" for root in label_roots
+    ] + [
+        root / "ood_labels" / "labels" / "ood_disease_types.csv" for root in label_roots
+    ], "OOD label CSV")
+
     # COBRA BCC
-    bcc_csv = cfg.data_root / "labels" / "bcc_bcc.csv"
     bcc_dir = cfg.data_root / "cobra_bcc"
     with open(bcc_csv) as f:
         for row in csv.DictReader(f):
@@ -208,7 +235,6 @@ def create_unified_labels(cfg):
                 })
 
     # COBRA OOD
-    ood_csv = cfg.data_root / "labels" / "ood_disease_types.csv"
     ood_dir = cfg.data_root / "cobra_ood" / "images"
     with open(ood_csv) as f:
         for row in csv.DictReader(f):
@@ -251,9 +277,9 @@ def balanced_split(entries, feature_dir, cfg, test_size=0.15, val_size=0.15):
     for e in entries:
         feat_path = feature_dir / f"{e['slide_id']}.pt"
         if feat_path.exists():
-            slide_list.append((e["slide_id"], e["superclass"]))
+            slide_list.append(dict(e))
 
-    labels = [s[1] for s in slide_list]
+    labels = [s["superclass"] for s in slide_list]
     cc = Counter(labels)
     logger.info(f"    Slides with features: {len(slide_list)} → " +
                 ", ".join(f"{cfg.class_names[i]}={cc.get(i,0)}" for i in range(cfg.num_classes)))
@@ -346,10 +372,17 @@ class GatedAttentionMIL(nn.Module):
 class SlideDataset(Dataset):
     def __init__(self, slide_list, feature_dir):
         self.slides = []
-        for slide_id, label in slide_list:
+        self.meta = {}
+        for slide in slide_list:
+            slide_id = slide["slide_id"] if isinstance(slide, dict) else slide[0]
+            label = slide["superclass"] if isinstance(slide, dict) else slide[1]
             fp = feature_dir / f"{slide_id}.pt"
             if fp.exists():
                 self.slides.append((fp, label, slide_id))
+                self.meta[slide_id] = slide if isinstance(slide, dict) else {
+                    "slide_id": slide_id,
+                    "superclass": label,
+                }
 
     def __len__(self):
         return len(self.slides)
@@ -494,16 +527,17 @@ def train_and_evaluate(slide_list, labels, train_ids, val_ids, test_ids,
     # --- Test evaluation ---
     model.load_state_dict(torch.load(ckpt, weights_only=True))
     model.eval()
-    t_preds, t_labels, t_probs = [], [], []
+    t_preds, t_labels, t_probs, t_slide_ids = [], [], [], []
     with torch.no_grad():
         for i in range(len(test_ds)):
-            feat, lab, _ = test_ds[i]
+            feat, lab, sid = test_ds[i]
             feat = feat.to(device)
             logits, _ = model(feat)
             probs = F.softmax(logits, dim=1).cpu().numpy()[0]
             t_preds.append(logits.argmax(1).item())
             t_labels.append(lab)
             t_probs.append(probs)
+            t_slide_ids.append(sid)
 
     acc = accuracy_score(t_labels, t_preds)
     f1_mac = f1_score(t_labels, t_preds, average="macro", zero_division=0)
@@ -561,6 +595,61 @@ def train_and_evaluate(slide_list, labels, train_ids, val_ids, test_ids,
     if best_mel_thresh < 0.5:
         logger.info(f"    → Best melanoma-safe threshold: {best_mel_thresh} (F1={best_mel_f1_adj:.2%})")
 
+    phase1_rows = []
+    phase1_hard_cases = []
+    for sid, true_lab, pred_lab, probs in zip(t_slide_ids, t_labels, t_preds, t_probs):
+        meta = test_ds.meta.get(sid, {"slide_id": sid})
+        probs_arr = np.asarray(probs, dtype=np.float32)
+        order = np.argsort(probs_arr)[::-1]
+        top1 = float(probs_arr[order[0]])
+        top2 = float(probs_arr[order[1]]) if len(order) > 1 else 0.0
+        margin = top1 - top2
+        melanoma_prob = float(probs_arr[3])
+        is_melanoma = int(true_lab == 3)
+        is_melanoma_fn = int(true_lab == 3 and pred_lab != 3)
+        hard_case_candidate = int(true_lab == 3 and (pred_lab != 3 or top1 < 0.75 or margin < 0.22))
+        row = {
+            "slide_id": sid,
+            "source": meta.get("source", "unknown"),
+            "slide_path": meta.get("slide_path", ""),
+            "true_label": cfg.class_names[int(true_lab)],
+            "pred_label": cfg.class_names[int(pred_lab)],
+            "prediction_confidence": round(top1, 6),
+            "margin": round(margin, 6),
+            "melanoma_probability": round(melanoma_prob, 6),
+            "is_melanoma": is_melanoma,
+            "is_melanoma_fn": is_melanoma_fn,
+            "hard_case_candidate": hard_case_candidate,
+            "prob_normal_benign": round(float(probs_arr[0]), 6),
+            "prob_bcc": round(float(probs_arr[1]), 6),
+            "prob_scc": round(float(probs_arr[2]), 6),
+            "prob_melanoma": round(float(probs_arr[3]), 6),
+        }
+        phase1_rows.append(row)
+        if hard_case_candidate:
+            phase1_hard_cases.append(row)
+
+    phase1_fieldnames = [
+        "slide_id", "source", "slide_path", "true_label", "pred_label",
+        "prediction_confidence", "margin", "melanoma_probability", "is_melanoma",
+        "is_melanoma_fn", "hard_case_candidate", "prob_normal_benign",
+        "prob_bcc", "prob_scc", "prob_melanoma"
+    ]
+    pred_csv = output_dir / "phase1_test_predictions.csv"
+    with open(pred_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=phase1_fieldnames)
+        writer.writeheader()
+        writer.writerows(phase1_rows)
+
+    hard_csv = output_dir / "phase1_hard_cases.csv"
+    with open(hard_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=phase1_fieldnames)
+        writer.writeheader()
+        writer.writerows(phase1_hard_cases)
+
+    logger.info(f"  Phase 1 test prediction log saved: {pred_csv}")
+    logger.info(f"  Phase 1 hard-case rows saved: {hard_csv} ({len(phase1_hard_cases)} rows)")
+
     # --- Save results ---
     results = {
         "model": model_name, "experiment": experiment["tag"],
@@ -574,6 +663,12 @@ def train_and_evaluate(slide_list, labels, train_ids, val_ids, test_ids,
         "threshold_tuning": {
             "best_melanoma_threshold": best_mel_thresh,
             "best_f1_with_threshold": best_mel_f1_adj,
+        },
+        "phase1": {
+            "test_prediction_csv": str(pred_csv),
+            "hard_case_csv": str(hard_csv),
+            "hard_case_count": len(phase1_hard_cases),
+            "melanoma_fn_cases": sum(1 for r in phase1_hard_cases if r["is_melanoma_fn"]),
         },
         "confusion_matrix": cm.tolist(), "history": history,
         "best_epoch": best_epoch,

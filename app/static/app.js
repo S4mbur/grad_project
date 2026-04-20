@@ -13,13 +13,16 @@ const state = {
     viewer: null,
     heatmapVisible: false,
     heatmapOverlayId: null,
+    currentHeatmapVariant: 'attention',
+    heatmapViews: [],
     analysisStartTime: null,
     history: [],
     slideInfo: null,
     topTilesData: [],
+    currentResult: null,
     modelsData: null,    // from /api/models
     selectedModel: 'ensemble_3_best',
-};
+  };
 
 const API = '';
 
@@ -172,22 +175,45 @@ async function loadModels() {
 function updateModelInfo(key) {
     const infoEl = document.getElementById('model-info');
     const f1El = document.getElementById('model-f1');
+    const thresholdEl = document.getElementById('model-threshold');
     const descEl = document.getElementById('model-desc');
 
-    // Check ensemble presets first
     const ensemble = state.modelsData?.ensembles?.find(e => e.key === key);
     if (ensemble) {
-        f1El.textContent = `F1: ${(ensemble.f1 * 100).toFixed(1)}% · AUC: ${(ensemble.auc * 100).toFixed(1)}% · MelFN: 0 ✓`;
+        f1El.textContent = `F1: ${(ensemble.f1 * 100).toFixed(1)}% | AUC: ${(ensemble.auc * 100).toFixed(1)}% | MelFN: 0`;
+        thresholdEl.textContent = formatThresholdPolicy(ensemble.threshold_policy || null);
         descEl.textContent = ensemble.description;
         return;
     }
 
     const model = state.modelsData?.models?.find(m => m.key === key);
     if (model) {
-        const fnText = model.mel_fn !== undefined && model.mel_fn !== '?' ? ` · MelFN: ${model.mel_fn}` : '';
-        f1El.textContent = `F1: ${(model.f1 * 100).toFixed(1)}% · AUC: ${(model.auc * 100).toFixed(1)}%${fnText}`;
+        const fnText = model.mel_fn !== undefined && model.mel_fn !== '?' ? ` | MelFN: ${model.mel_fn}` : '';
+        f1El.textContent = `F1: ${(model.f1 * 100).toFixed(1)}% | AUC: ${(model.auc * 100).toFixed(1)}%${fnText}`;
+        thresholdEl.textContent = formatThresholdPolicy(model.threshold_policy || null);
         descEl.textContent = model.description;
     }
+}
+
+function formatThresholdPolicy(policy) {
+    if (!policy || !policy.available) {
+        return 'Threshold: default multiclass decision';
+    }
+    if (policy.label) {
+        return String(policy.label);
+    }
+
+    const parts = [];
+    if (policy.melanoma_safe_threshold !== null && policy.melanoma_safe_threshold !== undefined) {
+        parts.push(`Mel review threshold ${Number(policy.melanoma_safe_threshold).toFixed(2)}`);
+    }
+    if (policy.selection_basis) {
+        parts.push(String(policy.selection_basis));
+    }
+    if (!parts.length) {
+        parts.push('Threshold registry loaded');
+    }
+    return parts.join(' | ');
 }
 
 function getModelDisplayName(key) {
@@ -269,6 +295,7 @@ function onAnalysisComplete(jobId, data) {
 
     const result = data.result;
     if (!result) return;
+    state.currentResult = result;
 
     if (data.slide_info) {
         state.slideInfo = data.slide_info;
@@ -288,13 +315,18 @@ function onAnalysisComplete(jobId, data) {
 
     // Prediction card
     const card = document.getElementById('prediction-card');
-    const classKey = _getClassKey(result.prediction);
+    const classKey = result.prediction_key || _getClassKey(result.raw_prediction || result.prediction);
     card.className = 'prediction-card ' + classKey + ' slide-up';
     document.getElementById('prediction-value').textContent = result.prediction;
 
     const maxProb = Math.max(...Object.values(result.probabilities));
+    const safety = result.safety || null;
+    const displayConfidence = safety && safety.confidence !== undefined
+        ? safety.confidence
+        : maxProb;
     document.getElementById('prediction-confidence').textContent =
-        `Confidence: ${(maxProb * 100).toFixed(1)}%`;
+        `Confidence: ${(displayConfidence * 100).toFixed(1)}%`;
+    renderSafetyPanel(safety);
 
     // Probability bars (4 classes)
     const probs = result.probabilities;
@@ -332,10 +364,13 @@ function onAnalysisComplete(jobId, data) {
     document.getElementById('stat-time').textContent = elapsed;
 
     // Top tiles
+    document.getElementById('top-tiles-title').textContent = result.top_tiles_title || 'Top Attention Tiles';
     renderTopTiles(result.top_tiles || [], jobId);
+    renderRetrievalPanel(result.retrieval || null);
 
     // Init viewer
     initSlideViewer(jobId);
+    renderHeatmapViewControls(result.heatmap_views || [{ key: 'attention', label: 'Attention' }], result.default_heatmap_view || 'attention');
 
     // Show slide info bar
     document.getElementById('slide-info-bar').classList.add('active');
@@ -344,13 +379,14 @@ function onAnalysisComplete(jobId, data) {
     document.getElementById('btn-export').style.display = '';
 
     // Update history
-    updateHistoryItem(jobId, 'completed', result.prediction);
+    updateHistoryItem(jobId, 'completed', result.prediction, classKey);
 
     showToast(`Analysis complete: ${result.prediction} (${result.model_used})`, 'success');
 }
 
 function _getClassKey(prediction) {
     const p = (prediction || '').toLowerCase();
+    if (p.includes('abstain') || p.includes('expert review')) return 'abstain';
     if (p.includes('normal') || p.includes('benign')) return 'normal';
     if (p.includes('bcc')) return 'bcc';
     if (p.includes('scc')) return 'scc';
@@ -367,6 +403,98 @@ function animateProbBar(cls, value) {
         bar.style.width = pct + '%';
         val.textContent = pct + '%';
     });
+}
+
+function _riskBadgeClass(level) {
+    const v = (level || '').toLowerCase();
+    if (v.includes('urgent')) return 'risk-urgent';
+    if (v.includes('high')) return 'risk-high';
+    if (v.includes('moderate')) return 'risk-moderate';
+    return 'risk-low';
+}
+
+function _oodBadgeClass(level) {
+    const v = (level || '').toLowerCase();
+    if (v.includes('strong')) return 'ood-strong';
+    if (v.includes('moderate')) return 'ood-moderate';
+    return 'ood-low';
+}
+
+function renderSafetyPanel(safety) {
+    const panel = document.getElementById('safety-panel');
+    if (!panel || !safety) {
+        if (panel) panel.style.display = 'none';
+        return;
+    }
+
+    panel.style.display = 'block';
+
+    const riskBadge = document.getElementById('safety-risk-badge');
+    riskBadge.className = `safety-badge ${_riskBadgeClass(safety.risk_level)}`;
+    riskBadge.textContent = safety.risk_level || 'Unknown Risk';
+
+    const abstainBadge = document.getElementById('safety-abstain-badge');
+    abstainBadge.className = `safety-badge ${safety.abstain_recommended ? 'abstain-on' : 'abstain-off'}`;
+    abstainBadge.textContent = safety.abstain_recommended ? 'Abstain Recommended' : 'No Abstain';
+
+    const ood = safety.ood || {};
+    const oodBadge = document.getElementById('safety-ood-badge');
+    oodBadge.className = `safety-badge ${_oodBadgeClass(ood.ood_level)}`;
+    oodBadge.textContent = ood.available ? `OOD ${ood.ood_level || 'low'}` : 'OOD N/A';
+
+    const rawNote = safety.raw_prediction && safety.display_prediction && safety.raw_prediction !== safety.display_prediction
+        ? ` Raw model prediction: ${safety.raw_prediction}.`
+        : '';
+    document.getElementById('safety-summary').textContent =
+        (safety.recommendation || 'No safety recommendation.') + rawNote;
+
+    document.getElementById('safety-uncertainty').textContent = `${((safety.uncertainty || 0) * 100).toFixed(1)}%`;
+    document.getElementById('safety-margin').textContent = `${((safety.margin || 0) * 100).toFixed(1)}%`;
+    document.getElementById('safety-melanoma-prob').textContent = `${((safety.melanoma_probability || 0) * 100).toFixed(1)}%`;
+    document.getElementById('safety-disagreement').textContent =
+        safety.ensemble_disagreement === null || safety.ensemble_disagreement === undefined
+            ? 'N/A'
+            : `${(safety.ensemble_disagreement * 100).toFixed(1)}%`;
+    document.getElementById('safety-ood-score').textContent =
+        ood.ood_score === null || ood.ood_score === undefined
+            ? 'N/A'
+            : `${(ood.ood_score * 100).toFixed(1)}%`;
+    document.getElementById('safety-id-support').textContent =
+        safety.id_support_score === null || safety.id_support_score === undefined
+            ? 'N/A'
+            : `${(safety.id_support_score * 100).toFixed(1)}%`;
+    document.getElementById('safety-score').textContent =
+        safety.safety_score === null || safety.safety_score === undefined
+            ? 'N/A'
+            : `${(safety.safety_score * 100).toFixed(1)}%`;
+    const calibration = safety.calibration || {};
+    const calibrationText = calibration.available
+        ? `T=${Number(calibration.temperature || 1).toFixed(2)}`
+        : 'Not loaded';
+    document.getElementById('safety-calibration').textContent = calibrationText;
+    document.getElementById('safety-threshold').textContent = formatThresholdPolicy(safety.threshold_policy || null);
+
+    const flags = [];
+    (safety.reasons || []).forEach(r => flags.push(r));
+    if (safety.melanoma_first_guard) flags.push('Melanoma-first safeguard active');
+    if (safety.hard_case_candidate) flags.push('Hard-case candidate');
+    if (ood.available && ood.nearest_class) {
+        flags.push(`Nearest in-distribution class: ${ood.nearest_class}`);
+    }
+    if (calibration.available && calibration.ece_after !== undefined && calibration.ece_after !== null) {
+        flags.push(`Calibrated ECE: ${(Number(calibration.ece_after) * 100).toFixed(1)}%`);
+    }
+    if (safety.threshold_policy && safety.threshold_policy.threshold_triggered) {
+        flags.push('Tuned melanoma review threshold was triggered');
+    }
+    if (safety.raw_prediction && safety.display_prediction && safety.raw_prediction !== safety.display_prediction) {
+        flags.push(`Raw model prediction: ${safety.raw_prediction}`);
+    }
+    if (!flags.length) flags.push('No active safety flags');
+
+    document.getElementById('safety-flags').innerHTML = flags
+        .map(flag => `<span class="safety-flag">${flag}</span>`)
+        .join('');
 }
 
 // ─────────────────── Top Tiles ─────────────────────────
@@ -390,7 +518,7 @@ function renderTopTiles(tiles, jobId) {
         div.innerHTML = `
             <img src="${API}${tile.image_url}" alt="Tile ${tile.rank}" loading="lazy">
             <span class="tile-rank">#${tile.rank}</span>
-            <span class="tile-attn">${(tile.attention * 100).toFixed(1)}%</span>
+            <span class="tile-attn">${((tile.shared_score ?? tile.attention) * 100).toFixed(1)}%</span>
             <span class="tile-locate" title="Navigate to this tile on slide">📍</span>
         `;
 
@@ -402,6 +530,158 @@ function renderTopTiles(tiles, jobId) {
 
         grid.appendChild(div);
     });
+}
+
+function renderRetrievalPanel(retrieval) {
+    const panel = document.getElementById('retrieval-panel');
+    const grid = document.getElementById('retrieval-grid');
+    const hardGrid = document.getElementById('hard-retrieval-grid');
+    const hardTitle = document.getElementById('hard-retrieval-title');
+    const summary = document.getElementById('retrieval-summary');
+
+    if (!panel || !grid || !hardGrid || !hardTitle || !summary) return;
+
+    if (!retrieval || !retrieval.available) {
+        panel.style.display = 'none';
+        grid.innerHTML = '';
+        hardGrid.innerHTML = '';
+        hardTitle.style.display = 'none';
+        return;
+    }
+
+    panel.style.display = 'block';
+    summary.textContent = `${retrieval.bank_display || retrieval.bank_key} • ${retrieval.bank_size || 0} reference cases • ${retrieval.hard_case_count || 0} hard melanoma cases`;
+    grid.innerHTML = _renderRetrievalCards(retrieval.similar_cases || [], 'No similar cases available.');
+
+    const hardCases = retrieval.hard_melanoma_matches || [];
+    hardTitle.style.display = hardCases.length ? 'block' : 'none';
+    hardGrid.innerHTML = hardCases.length
+        ? _renderRetrievalCards(hardCases, '')
+        : '';
+}
+
+function _renderRetrievalCards(items, emptyText = '') {
+    if (!items || !items.length) {
+        if (!emptyText) return '';
+        return `
+            <div class="retrieval-empty">
+                <div class="icon">R</div>
+                <p>${emptyText}</p>
+            </div>
+        `;
+    }
+
+    return items.map(item => `
+        <div class="retrieval-card">
+            <img class="retrieval-thumb" src="${API}${item.thumbnail_url}" alt="${item.filename}" loading="lazy">
+            <div class="retrieval-card-body">
+                <div class="retrieval-card-top">
+                    <span class="retrieval-label ${_getClassKey(item.true_label)}">${item.true_label}</span>
+                    <span class="retrieval-similarity">${((item.similarity || 0) * 100).toFixed(1)}%</span>
+                </div>
+                <div class="retrieval-file">${item.filename || item.slide_id}</div>
+                <div class="retrieval-meta">${item.source || 'unknown source'}</div>
+                <div class="retrieval-flags">
+                    ${item.is_hard_melanoma ? '<span class="retrieval-flag hard">Hard melanoma</span>' : ''}
+                </div>
+                <div class="retrieval-actions">
+                    <button class="retrieval-compare-btn" type="button" onclick="compareRetrievedCase('${item.slide_id}')">Compare</button>
+                </div>
+            </div>
+        </div>
+    `).join('');
+}
+
+function _resolveHeatmapVariant(resultLike, preferredVariant) {
+    const views = (resultLike && resultLike.heatmap_views) || [];
+    const keys = views.map(v => v.key);
+    if (preferredVariant && keys.includes(preferredVariant)) return preferredVariant;
+    return resultLike.default_heatmap_view || (keys[0] || 'attention');
+}
+
+function _resultHeatmapUrl(jobId, resultLike, preferredVariant) {
+    const variant = _resolveHeatmapVariant(resultLike, preferredVariant);
+    if (!variant || variant === 'attention' || variant === 'default') {
+        return `${API}/api/results/${jobId}/heatmap`;
+    }
+    return `${API}/api/results/${jobId}/heatmap/${variant}`;
+}
+
+function _renderCompareTiles(tiles) {
+    if (!tiles || !tiles.length) {
+        return '<div class="compare-empty">No top-tile data available.</div>';
+    }
+    return tiles.slice(0, 4).map(tile => `
+        <div class="compare-tile">
+            <img src="${API}${tile.image_url}" alt="Tile ${tile.rank}" loading="lazy">
+            <span class="compare-tile-rank">#${tile.rank}</span>
+            <span class="compare-tile-score">${((tile.shared_score ?? tile.attention) * 100).toFixed(1)}%</span>
+        </div>
+    `).join('');
+}
+
+function _renderCompareSummary(title, meta, jobId, resultLike, preferredVariant) {
+    const safety = resultLike.safety || {};
+    return `
+        <div class="compare-column">
+            <div class="compare-card-header">
+                <div>
+                    <div class="compare-title">${title}</div>
+                    <div class="compare-subtitle">${meta}</div>
+                </div>
+                <div class="compare-badge ${_getClassKey(resultLike.prediction || resultLike.raw_prediction)}">${resultLike.prediction}</div>
+            </div>
+            <div class="compare-stats">
+                <div class="compare-stat"><span>Decision</span><strong>${resultLike.decision_status || 'predicted'}</strong></div>
+                <div class="compare-stat"><span>Risk</span><strong>${safety.risk_level || 'N/A'}</strong></div>
+                <div class="compare-stat"><span>Safety</span><strong>${safety.safety_score !== undefined ? `${(safety.safety_score * 100).toFixed(1)}%` : 'N/A'}</strong></div>
+                <div class="compare-stat"><span>Mel Prob.</span><strong>${safety.melanoma_probability !== undefined ? `${(safety.melanoma_probability * 100).toFixed(1)}%` : 'N/A'}</strong></div>
+            </div>
+            <img class="compare-heatmap" src="${_resultHeatmapUrl(jobId, resultLike, preferredVariant)}" alt="${title} heatmap">
+            <div class="compare-tiles">${_renderCompareTiles(resultLike.top_tiles || [])}</div>
+        </div>
+    `;
+}
+
+async function compareRetrievedCase(slideId) {
+    if (!state.currentJobId || !state.currentResult) {
+        showToast('Analyze a slide first to open comparison mode', 'error');
+        return;
+    }
+
+    const modal = document.getElementById('compare-modal');
+    const body = document.getElementById('compare-modal-body');
+    const title = document.getElementById('compare-modal-title');
+    modal.classList.add('visible');
+    title.textContent = 'Similar Case Comparison';
+    body.innerHTML = '<div class="compare-loading">Loading retrieved case analysis...</div>';
+
+    try {
+        const resp = await fetch(`${API}/api/retrieval/cases/${slideId}/compare?model=${encodeURIComponent(state.selectedModel)}`);
+        const data = await resp.json();
+        if (!resp.ok) {
+            throw new Error(data.error || 'Failed to build comparison view');
+        }
+
+        const currentMeta = `${state.currentResult.model_used || state.selectedModel} • ${state.currentResult.raw_prediction || state.currentResult.prediction}`;
+        const retrievedMeta = `${data.model_display} • ${data.true_label} • ${data.source}`;
+        const preferredVariant = state.currentHeatmapVariant || (state.currentResult.default_heatmap_view || 'attention');
+
+        body.innerHTML = `
+            <div class="compare-layout">
+                ${_renderCompareSummary('Current Case', currentMeta, state.currentJobId, state.currentResult, preferredVariant)}
+                ${_renderCompareSummary('Retrieved Case', retrievedMeta, data.job_id, data.result, preferredVariant)}
+            </div>
+        `;
+    } catch (err) {
+        body.innerHTML = `<div class="compare-error">${err.message || 'Failed to load comparison.'}</div>`;
+        showToast('Failed to load retrieved case comparison', 'error');
+    }
+}
+
+function closeCompareModal(event) {
+    if (event && event.target !== event.currentTarget) return;
+    document.getElementById('compare-modal').classList.remove('visible');
 }
 
 // ─────────────── Navigate to Tile on Viewer ────────────
@@ -463,20 +743,37 @@ function _flashTileMarker(coord, slideW, tileRealSize) {
 function openTileModal(tile, jobId) {
     const modal = document.getElementById('tile-modal');
     modal.classList.add('visible');
+    const primaryScore = tile.shared_score ?? tile.attention;
+    const primaryLabel = tile.shared_score !== undefined ? 'Shared Focus' : 'Attention';
 
     document.getElementById('modal-tile-title').textContent =
-        `Tile #${tile.rank} – Attention: ${(tile.attention * 100).toFixed(2)}%`;
+        `Tile #${tile.rank} – ${primaryLabel}: ${(primaryScore * 100).toFixed(2)}%`;
     document.getElementById('modal-tile-image').src = `${API}${tile.image_url}`;
 
     const infoDiv = document.getElementById('modal-tile-info');
+    const sharedBlock = tile.shared_score !== undefined ? `
+        <div class="stat-card">
+            <div class="stat-value">${(tile.shared_score * 100).toFixed(3)}%</div>
+            <div class="stat-label">Shared Score</div>
+        </div>` : '';
+    const consensusBlock = tile.consensus_score !== undefined ? `
+        <div class="stat-card">
+            <div class="stat-value">${(tile.consensus_score * 100).toFixed(3)}%</div>
+            <div class="stat-label">Consensus</div>
+        </div>` : '';
+    const disagreementBlock = tile.disagreement_score !== undefined ? `
+        <div class="stat-card">
+            <div class="stat-value">${(tile.disagreement_score * 100).toFixed(3)}%</div>
+            <div class="stat-label">Disagreement</div>
+        </div>` : '';
     infoDiv.innerHTML = `
         <div class="stat-card">
             <div class="stat-value">${tile.rank}</div>
             <div class="stat-label">Rank</div>
         </div>
         <div class="stat-card">
-            <div class="stat-value">${(tile.attention * 100).toFixed(3)}%</div>
-            <div class="stat-label">Attention Weight</div>
+            <div class="stat-value">${(primaryScore * 100).toFixed(3)}%</div>
+            <div class="stat-label">${primaryLabel}</div>
         </div>
         <div class="stat-card">
             <div class="stat-value">${tile.coord.x}, ${tile.coord.y}</div>
@@ -486,6 +783,9 @@ function openTileModal(tile, jobId) {
             <div class="stat-value">${tile.coord.size}×${tile.coord.size}</div>
             <div class="stat-label">Tile Size</div>
         </div>
+        ${sharedBlock}
+        ${consensusBlock}
+        ${disagreementBlock}
     `;
 
     const navBtn = document.getElementById('modal-nav-btn');
@@ -555,12 +855,56 @@ function initSlideViewer(jobId) {
     document.getElementById('viewer-controls').classList.add('active');
 
     state.heatmapVisible = false;
+    state.currentHeatmapVariant = state.currentHeatmapVariant || 'attention';
     document.getElementById('heatmap-toggle').checked = false;
     const heatBtn = document.getElementById('btn-heatmap-viewer');
     if (heatBtn) heatBtn.classList.remove('active');
 }
 
 // ───────────────── Heatmap ─────────────────────────────
+
+function _heatmapOverlayUrl(jobId, variant) {
+    if (!variant || variant === 'attention' || variant === 'default') {
+        return `${API}/api/results/${jobId}/heatmap_only`;
+    }
+    return `${API}/api/results/${jobId}/heatmap_only/${variant}`;
+}
+
+function renderHeatmapViewControls(views, defaultVariant = 'attention') {
+    const wrap = document.getElementById('heatmap-view-controls');
+    const buttons = document.getElementById('heatmap-view-buttons');
+    state.heatmapViews = views || [];
+    state.currentHeatmapVariant = defaultVariant || 'attention';
+
+    if (!views || views.length <= 1) {
+        wrap.style.display = 'none';
+        buttons.innerHTML = '';
+        return;
+    }
+
+    wrap.style.display = 'block';
+    buttons.innerHTML = views.map(view => `
+        <button
+            class="heatmap-view-btn ${view.key === state.currentHeatmapVariant ? 'active' : ''}"
+            data-variant="${view.key}"
+            type="button"
+            onclick="setHeatmapVariant('${view.key}')"
+            title="${view.description || view.label}"
+        >${view.label}</button>
+    `).join('');
+}
+
+function setHeatmapVariant(variant) {
+    state.currentHeatmapVariant = variant;
+    const buttons = document.querySelectorAll('.heatmap-view-btn');
+    buttons.forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.variant === variant);
+    });
+
+    if (state.heatmapVisible) {
+        toggleHeatmap(true);
+    }
+}
 
 function toggleHeatmap(enabled) {
     if (!state.currentJobId || !state.viewer) return;
@@ -569,9 +913,10 @@ function toggleHeatmap(enabled) {
     const heatBtn = document.getElementById('btn-heatmap-viewer');
 
     if (enabled) {
+        const overlaySrc = _heatmapOverlayUrl(state.currentJobId, state.currentHeatmapVariant);
         if (!state.heatmapOverlayId) {
             const img = document.createElement('img');
-            img.src = `${API}/api/results/${state.currentJobId}/heatmap_only`;
+            img.src = overlaySrc;
             img.id = 'osd-heatmap-overlay';
             img.style.opacity = '0.6';
             img.style.pointerEvents = 'none';
@@ -584,7 +929,12 @@ function toggleHeatmap(enabled) {
             state.heatmapOverlayId = 'osd-heatmap-overlay';
         } else {
             const el = document.getElementById('osd-heatmap-overlay');
-            if (el) el.style.opacity = '0.6';
+            if (el) {
+                if (el.src !== overlaySrc) {
+                    el.src = overlaySrc;
+                }
+                el.style.opacity = '0.6';
+            }
         }
         if (heatBtn) heatBtn.classList.add('active');
     } else {
@@ -622,16 +972,17 @@ function resetView() {
 
 // ───────────────── History ─────────────────────────────
 
-function addToHistory(jobId, filename, status, prediction, model) {
-    state.history.unshift({ jobId, filename, status, prediction, model, createdAt: new Date() });
+function addToHistory(jobId, filename, status, prediction, model, predictionKey=null) {
+    state.history.unshift({ jobId, filename, status, prediction, model, predictionKey, createdAt: new Date() });
     renderHistory();
 }
 
-function updateHistoryItem(jobId, status, prediction) {
+function updateHistoryItem(jobId, status, prediction, predictionKey=null) {
     const item = state.history.find(h => h.jobId === jobId);
     if (item) {
         item.status = status;
         if (prediction) item.prediction = prediction;
+        if (predictionKey) item.predictionKey = predictionKey;
     }
     renderHistory();
 }
@@ -649,7 +1000,7 @@ function renderHistory() {
 
     list.innerHTML = state.history.map(h => {
         const badgeClass = h.status === 'completed'
-            ? _getClassKey(h.prediction || '')
+            ? (h.predictionKey || _getClassKey(h.prediction || ''))
             : h.status;
         const isActive = h.jobId === state.currentJobId ? 'active' : '';
         const time = h.createdAt
@@ -727,6 +1078,7 @@ function showToast(message, type = 'info') {
 document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
         closeTileModal();
+        closeCompareModal();
     }
     if (e.key === 'h' && !e.ctrlKey && !e.metaKey && e.target.tagName !== 'INPUT') {
         const toggle = document.getElementById('heatmap-toggle');
