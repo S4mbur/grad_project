@@ -16,6 +16,7 @@ import io
 import json
 import uuid
 import time
+import csv
 import shutil
 import logging
 import threading
@@ -91,6 +92,9 @@ class AppConfig:
     UNIFIED_SAFETY_HIGH = 0.72
     UNIFIED_SAFETY_MODERATE = 0.48
     DEFAULT_TEMPERATURE = 1.0
+
+    # Cost-aware retrieval
+    RETRIEVAL_ACTIVE_METHOD = "trlq_quotient_v2"
 
     # DZI (on-demand)
     DZI_TILE_SIZE = 254
@@ -437,6 +441,7 @@ _mil_model_cache = {}     # model_key -> GatedAttentionMIL
 _phase2_registry_cache = {}
 _phase4_registry_cache = {}
 _phase0_registry_cache = {}
+_retrieval_signal_cache = {}
 
 
 def _ensure_torch():
@@ -701,6 +706,9 @@ def run_analysis(job_id: str, slide_path: str, model_key: str):
                 model_key,
                 ensemble_model_keys=ENSEMBLE_MODELS_RUN,
                 ensemble_bag_embeddings=all_bag_embeddings,
+                probabilities=probabilities,
+                safety=safety,
+                query_slide_id=Path(slide_path).stem,
             )
 
         else:
@@ -724,7 +732,13 @@ def run_analysis(job_id: str, slide_path: str, model_key: str):
                 raw_probabilities=raw_probabilities,
             )
             safety = _annotate_threshold_policy(safety, model_key)
-            retrieval = _retrieve_similar_cases(model_key, bag_embedding=bag_embedding)
+            retrieval = _retrieve_similar_cases(
+                model_key,
+                bag_embedding=bag_embedding,
+                probabilities=probabilities,
+                safety=safety,
+                query_slide_id=Path(slide_path).stem,
+            )
 
         _update_job(job_id, progress=80, message="Generating heatmap...")
 
@@ -782,11 +796,12 @@ def run_analysis(job_id: str, slide_path: str, model_key: str):
             "model_key": model_key,
             "timestamp": datetime.now().isoformat(),
         }
-        result["artifacts"] = _build_result_artifacts(job_id, result)
-
         # For ensemble, include individual model predictions
         if model_results:
             result["ensemble_details"] = model_results
+
+        result["calculation_details"] = _build_result_calculation_details(result, slide_info)
+        result["artifacts"] = _build_result_artifacts(job_id, result)
 
         _record_phase1_inference_case(job_id, slide_path, model_key, model_display, slide_info, result)
 
@@ -1205,12 +1220,46 @@ def _annotate_threshold_policy(safety, model_key):
     policy = _build_threshold_policy(model_key)
     safety["threshold_policy"] = policy
     threshold_value = policy.get("melanoma_safe_threshold")
+    details = dict(safety.get("details") or {})
+    details["threshold_policy"] = {
+        "title": "Melanoma review threshold policy",
+        "summary": "A calibrated melanoma review threshold is applied after the raw model prediction so borderline melanoma evidence is not hidden by a different top class.",
+        "clinical_context": [
+            "This policy is designed around melanoma false-negative reduction: if melanoma probability is clinically non-trivial, the app should prefer review over silent BCC/SCC/benign finalization.",
+            "The threshold does not diagnose melanoma by itself. It changes the workflow status by surfacing cases that deserve expert review."
+        ],
+        "technical_context": [
+            "The threshold value is loaded from the phase-0 threshold registry when available for the selected model or ensemble.",
+            "The rule is evaluated on the calibrated model probability P(Melanoma), not on the heatmap intensity or retrieval score."
+        ],
+        "formulae": [
+            "threshold_triggered = P(Melanoma) >= melanoma_safe_threshold",
+            "review_signal = threshold_triggered and raw_prediction != Melanoma",
+        ],
+        "inputs": {
+            "raw_prediction": safety.get("raw_prediction"),
+            "melanoma_probability": round(float(safety.get("melanoma_probability", 0.0)), 4),
+            "melanoma_safe_threshold": threshold_value,
+            "policy_available": bool(policy.get("available")),
+            "selection_basis": policy.get("selection_basis"),
+            "source_run": policy.get("source_run"),
+            "evaluation_split": policy.get("evaluation_split"),
+        },
+        "replication_steps": [
+            "Load the selected model's threshold registry entry.",
+            "Read melanoma_probability from the calibrated slide-level probability vector.",
+            "Compare melanoma_probability against melanoma_safe_threshold.",
+            "If the threshold is crossed while the raw class is not Melanoma, mark a review signal."
+        ],
+    }
+    safety["details"] = details
     if threshold_value is None:
         return safety
 
     melanoma_probability = float(safety.get("melanoma_probability", 0.0))
     threshold_triggered = melanoma_probability >= float(threshold_value)
     safety["threshold_policy"]["threshold_triggered"] = threshold_triggered
+    safety["details"]["threshold_policy"]["inputs"]["threshold_triggered"] = threshold_triggered
     if threshold_triggered and safety.get("raw_prediction") != "Melanoma":
         reasons = list(safety.get("reasons", []))
         trigger_reason = "Melanoma probability crossed the tuned review threshold"
@@ -1218,8 +1267,10 @@ def _annotate_threshold_policy(safety, model_key):
             reasons.append(trigger_reason)
         safety["reasons"] = reasons
         safety["threshold_policy"]["review_signal"] = True
+        safety["details"]["threshold_policy"]["inputs"]["review_signal"] = True
     else:
         safety["threshold_policy"]["review_signal"] = False
+        safety["details"]["threshold_policy"]["inputs"]["review_signal"] = False
     return safety
 
 
@@ -1350,6 +1401,29 @@ def _merge_phase2_safety(phase1_safety, probabilities, model_key, bag_embedding,
     if disagreement is not None:
         components.append(float(disagreement))
     unified_safety_score = float(np.mean(components))
+    component_details = [
+        {
+            "name": "uncertainty",
+            "value": round(float(safety.get("uncertainty", 0.0)), 4),
+            "meaning": "Normalized entropy of the calibrated class probabilities.",
+        },
+        {
+            "name": "inverse_margin",
+            "value": round(float(np.clip(1.0 - safety.get("margin", 0.0), 0.0, 1.0)), 4),
+            "meaning": "1 - margin; higher value means top classes are closer.",
+        },
+        {
+            "name": "ood_score",
+            "value": round(float(ood["ood_score"]), 4) if ood["ood_score"] is not None else 0.0,
+            "meaning": "Out-of-distribution shift score estimated from class-centroid distance.",
+        },
+    ]
+    if disagreement is not None:
+        component_details.append({
+            "name": "ensemble_disagreement",
+            "value": round(float(disagreement), 4),
+            "meaning": "Fraction of ensemble votes outside the majority class.",
+        })
 
     reasons = list(safety.get("reasons", []))
     if ood["available"] and ood["ood_level"] == "moderate":
@@ -1390,6 +1464,49 @@ def _merge_phase2_safety(phase1_safety, probabilities, model_key, bag_embedding,
     safety["unified_safety_score"] = round(unified_safety_score, 4)
     safety["safety_score"] = round(unified_safety_score, 4)
     safety["id_support_score"] = ood["id_support_score"]
+    details = dict(safety.get("details") or {})
+    details["phase2"] = {
+        "title": "Phase 2 unified safety calculation",
+        "summary": "Phase 2 combines calibrated uncertainty, class-margin risk, and OOD evidence into a single review-oriented safety score.",
+        "clinical_context": [
+            "OOD evidence means the slide embedding does not sit close to the training/reference distribution, so the model may be extrapolating.",
+            "The unified score is designed to make risk visible even when the raw class probability looks confident."
+        ],
+        "technical_context": [
+            "OOD distance is estimated in bag-embedding space against class centroids stored in the phase-2 registry.",
+            "The final score is an arithmetic mean of normalized risk components so every component stays in a comparable 0-1 range."
+        ],
+        "formulae": [
+            "inverse_margin = clip(1 - margin, 0, 1)",
+            "ood_score = clip((nearest_normalized_centroid_distance - 1.0) / 0.8, 0, 1)",
+            "unified_safety_score = mean(uncertainty, inverse_margin, ood_score, optional ensemble_disagreement)",
+            f"high risk if unified_safety_score >= {cfg.UNIFIED_SAFETY_HIGH:.2f}",
+            f"moderate risk if unified_safety_score >= {cfg.UNIFIED_SAFETY_MODERATE:.2f}",
+        ],
+        "components": component_details,
+        "ood": ood,
+        "thresholds": {
+            "ood_moderate_normalized_distance": cfg.OOD_MODERATE_THRESHOLD,
+            "ood_strong_normalized_distance": cfg.OOD_STRONG_THRESHOLD,
+            "unified_safety_moderate": cfg.UNIFIED_SAFETY_MODERATE,
+            "unified_safety_high": cfg.UNIFIED_SAFETY_HIGH,
+        },
+        "outputs": {
+            "unified_safety_score": round(unified_safety_score, 4),
+            "risk_level": safety.get("risk_level"),
+            "decision_status": safety.get("decision_status"),
+            "abstain_recommended": safety.get("abstain_recommended"),
+            "reasons": reasons,
+        },
+        "replication_steps": [
+            "Read uncertainty and margin from Phase 1.",
+            "Compute inverse_margin = 1 - margin.",
+            "Estimate nearest class-centroid distance in embedding space and convert it to ood_score.",
+            "Average all available risk components.",
+            "Map the unified score to low/moderate/high risk thresholds."
+        ],
+    }
+    safety["details"] = details
     return safety
 
 
@@ -1443,6 +1560,29 @@ def _merge_phase2_ensemble_safety(phase1_safety, probabilities, model_keys, bag_
     if disagreement is not None:
         components.append(float(disagreement))
     unified_safety_score = float(np.mean(components))
+    component_details = [
+        {
+            "name": "uncertainty",
+            "value": round(float(safety.get("uncertainty", 0.0)), 4),
+            "meaning": "Normalized entropy of the ensemble-averaged class probabilities.",
+        },
+        {
+            "name": "inverse_margin",
+            "value": round(float(np.clip(1.0 - safety.get("margin", 0.0), 0.0, 1.0)), 4),
+            "meaning": "1 - margin; higher value means top classes are closer.",
+        },
+        {
+            "name": "mean_ood_score",
+            "value": round(float(ood["ood_score"]), 4) if ood["ood_score"] is not None else 0.0,
+            "meaning": "Mean out-of-distribution score across available ensemble components.",
+        },
+    ]
+    if disagreement is not None:
+        component_details.append({
+            "name": "ensemble_disagreement",
+            "value": round(float(disagreement), 4),
+            "meaning": "Fraction of component predictions outside the majority class.",
+        })
 
     reasons = list(safety.get("reasons", []))
     if ood["available"] and ood["ood_level"] == "moderate":
@@ -1479,6 +1619,49 @@ def _merge_phase2_ensemble_safety(phase1_safety, probabilities, model_keys, bag_
     safety["unified_safety_score"] = round(unified_safety_score, 4)
     safety["safety_score"] = round(unified_safety_score, 4)
     safety["id_support_score"] = ood["id_support_score"]
+    details = dict(safety.get("details") or {})
+    details["phase2"] = {
+        "title": "Phase 2 ensemble safety calculation",
+        "summary": "For ensembles, Phase 2 uses the same safety idea but averages OOD evidence across available component models and includes component disagreement.",
+        "clinical_context": [
+            "If component models disagree or several component embeddings look out-of-distribution, the case should be reviewed even if the averaged probability has a clear top class.",
+            "This is especially useful for melanoma-vs-SCC or melanoma-vs-benign borderline cases where different encoders can emphasize different histologic patterns."
+        ],
+        "technical_context": [
+            "Each component embedding is scored against its own OOD registry when available.",
+            "The ensemble OOD score is the mean of available per-model OOD scores; ensemble disagreement is included as an additional normalized risk component."
+        ],
+        "formulae": [
+            "inverse_margin = clip(1 - margin, 0, 1)",
+            "ensemble_ood_score = mean(per_model_ood_score)",
+            "unified_safety_score = mean(uncertainty, inverse_margin, ensemble_ood_score, ensemble_disagreement)",
+            f"high risk if unified_safety_score >= {cfg.UNIFIED_SAFETY_HIGH:.2f}",
+            f"moderate risk if unified_safety_score >= {cfg.UNIFIED_SAFETY_MODERATE:.2f}",
+        ],
+        "components": component_details,
+        "ood": ood,
+        "thresholds": {
+            "ood_moderate_normalized_distance": cfg.OOD_MODERATE_THRESHOLD,
+            "ood_strong_normalized_distance": cfg.OOD_STRONG_THRESHOLD,
+            "unified_safety_moderate": cfg.UNIFIED_SAFETY_MODERATE,
+            "unified_safety_high": cfg.UNIFIED_SAFETY_HIGH,
+        },
+        "outputs": {
+            "unified_safety_score": round(unified_safety_score, 4),
+            "risk_level": safety.get("risk_level"),
+            "decision_status": safety.get("decision_status"),
+            "abstain_recommended": safety.get("abstain_recommended"),
+            "reasons": reasons,
+        },
+        "replication_steps": [
+            "Compute ensemble uncertainty and margin from averaged probabilities.",
+            "Compute inverse_margin = 1 - margin.",
+            "Compute OOD score for each component model with an available registry.",
+            "Average component OOD scores.",
+            "Average uncertainty, inverse margin, ensemble OOD, and disagreement into the unified safety score."
+        ],
+    }
+    safety["details"] = details
     return safety
 
 
@@ -1501,19 +1684,568 @@ def _build_retrieval_query_embedding(model_key, bag_embedding=None, ensemble_mod
     return _normalize_embedding(bag_embedding)
 
 
-def _format_retrieval_case(case_meta, similarity):
+def _retrieval_prediction_csv(model_key):
+    mcfg = MODEL_REGISTRY.get(model_key)
+    if not mcfg:
+        return None
+    checkpoint = mcfg.get("mil_checkpoint")
+    if not checkpoint:
+        return None
+    return Path(checkpoint).parent / "phase1_test_predictions.csv"
+
+
+def _load_retrieval_prediction_map(model_key):
+    path = _retrieval_prediction_csv(model_key)
+    if path is None or not path.exists():
+        return {}
+    cache_key = f"predictions|{model_key}|{path}"
+    mtime = path.stat().st_mtime
+    cached = _retrieval_signal_cache.get(cache_key)
+    if cached and cached["mtime"] == mtime:
+        return cached["rows"]
+
+    rows = {}
+    try:
+        with path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                sid = row.get("slide_id")
+                if sid:
+                    rows[sid] = row
+    except Exception:
+        logger.exception("Failed to load retrieval prediction CSV: %s", path)
+        rows = {}
+
+    _retrieval_signal_cache[cache_key] = {"mtime": mtime, "rows": rows}
+    return rows
+
+
+def _prob_dict_from_row(row, fallback_label=None):
+    if row:
+        vals = {
+            "Normal/Benign": row.get("prob_normal_benign"),
+            "BCC": row.get("prob_bcc"),
+            "SCC": row.get("prob_scc"),
+            "Melanoma": row.get("prob_melanoma"),
+        }
+        try:
+            probs = {k: float(v) for k, v in vals.items()}
+            total = sum(max(v, 0.0) for v in probs.values())
+            if total > 0:
+                return {k: max(v, 0.0) / total for k, v in probs.items()}
+        except (TypeError, ValueError):
+            pass
+
+    probs = {name: 0.05 for name in CLASS_NAMES.values()}
+    if fallback_label in probs:
+        probs[fallback_label] = 0.85
+    total = sum(probs.values())
+    return {k: v / total for k, v in probs.items()}
+
+
+def _signal_from_prob_dict(probs, pred_label=None, hard_case_candidate=False):
+    ordered = sorted(probs.items(), key=lambda kv: kv[1], reverse=True)
+    top1 = ordered[0] if ordered else ("Normal/Benign", 0.0)
+    top2 = ordered[1] if len(ordered) > 1 else ("", 0.0)
+    pred_label = pred_label or top1[0]
+    return {
+        "probs": {name: float(probs.get(name, 0.0)) for name in CLASS_NAMES.values()},
+        "pred_label": pred_label,
+        "confidence": float(top1[1]),
+        "margin": float(top1[1] - top2[1]),
+        "melanoma_probability": float(probs.get("Melanoma", 0.0)),
+        "hard_case_candidate": bool(hard_case_candidate),
+    }
+
+
+def _query_signal_from_result(probabilities, safety):
+    if probabilities is None:
+        return None
+    probs_arr = np.asarray(probabilities, dtype=np.float32).reshape(-1)
+    if probs_arr.size < N_CLASSES:
+        return None
+    probs = {CLASS_NAMES[i]: float(probs_arr[i]) for i in range(N_CLASSES)}
+    pred = CLASS_NAMES[int(np.argmax(probs_arr))]
+    return _signal_from_prob_dict(
+        probs,
+        pred_label=(safety or {}).get("raw_prediction") or pred,
+        hard_case_candidate=bool((safety or {}).get("hard_case_candidate")),
+    )
+
+
+def _signal_entropy(signal):
+    probs = np.asarray([signal["probs"][CLASS_NAMES[i]] for i in range(N_CLASSES)], dtype=np.float32)
+    probs = np.clip(probs, 1e-8, 1.0)
+    return float(-(probs * np.log(probs)).sum() / np.log(N_CLASSES))
+
+
+def _clinical_signature_from_signal(signal):
+    probs = signal["probs"]
+    return np.asarray(
+        [
+            probs["Normal/Benign"],
+            probs["BCC"],
+            probs["SCC"],
+            probs["Melanoma"],
+            signal["confidence"],
+            signal["margin"],
+            signal["melanoma_probability"],
+            _signal_entropy(signal),
+        ],
+        dtype=np.float32,
+    )
+
+
+def _pathology_axis_from_signal(signal):
+    probs = signal["probs"]
+    return np.asarray(
+        [
+            signal["melanoma_probability"],
+            probs["BCC"] + probs["SCC"],
+            probs["Normal/Benign"],
+            1.0 - signal["margin"],
+            _signal_entropy(signal),
+            float(signal["hard_case_candidate"]),
+        ],
+        dtype=np.float32,
+    )
+
+
+def _clinical_similarity(query_sig, candidate_sigs):
+    weights = np.asarray([0.5, 0.5, 0.5, 1.3, 0.5, 0.7, 1.2, 0.8], dtype=np.float32)
+    diff = np.abs(candidate_sigs - query_sig[None, :])
+    return np.clip(1.0 - (diff @ weights) / 5.0, 0.0, 1.0)
+
+
+def _pathology_axis_similarity(query_axis, candidate_axes):
+    weights = np.asarray([1.6, 0.8, 0.5, 1.0, 1.0, 1.2], dtype=np.float32)
+    diff = np.abs(candidate_axes - query_axis[None, :])
+    return np.clip(1.0 - (diff @ weights) / weights.sum(), 0.0, 1.0)
+
+
+def _risk_tier(signal):
+    melanoma_guard = signal["pred_label"] != "Melanoma" and signal["melanoma_probability"] >= 0.20
+    if melanoma_guard or signal["hard_case_candidate"] or signal["confidence"] < 0.62 or signal["margin"] < 0.18:
+        return "high"
+    if signal["confidence"] < 0.80 or signal["margin"] < 0.35 or signal["melanoma_probability"] >= 0.10:
+        return "moderate"
+    return "low"
+
+
+def _label_risk_rank(label):
+    if label == "Melanoma":
+        return 3
+    if label in {"BCC", "SCC"}:
+        return 1
+    return 0
+
+
+def _signal_risk_rank(signal):
+    if signal["pred_label"] == "Melanoma" or signal["melanoma_probability"] >= 0.35:
+        return 3
+    if signal["melanoma_probability"] >= 0.20 or signal["hard_case_candidate"]:
+        return 2
+    if signal["pred_label"] in {"BCC", "SCC"}:
+        return 1
+    return 0
+
+
+def _risk_lattice_similarity(query_rank, candidate_ranks):
+    candidate_ranks = np.asarray(candidate_ranks, dtype=np.float32)
+    base = 1.0 - np.abs(candidate_ranks - float(query_rank)) / 3.0
+    if query_rank >= 2:
+        base = np.where(candidate_ranks >= 2, np.maximum(base, 0.86), base)
+        base = np.where(candidate_ranks == 3, base + 0.08, base)
+    elif query_rank == 1:
+        base = np.where(candidate_ranks == 1, base + 0.05, base)
+    return np.clip(base, 0.05, 1.0)
+
+
+def _candidate_label_bonus(candidate_labels, signal, tier):
+    labels = np.asarray(candidate_labels)
+    bonus = np.zeros(len(labels), dtype=np.float32)
+    bonus[labels == signal["pred_label"]] += 0.08
+    if tier == "high" or signal["melanoma_probability"] >= 0.20:
+        bonus[labels == "Melanoma"] += 0.14
+    elif signal["melanoma_probability"] >= 0.10:
+        bonus[labels == "Melanoma"] += 0.05
+    return bonus
+
+
+def _unit_similarity_from_dot(dot_scores):
+    return np.clip((np.asarray(dot_scores, dtype=np.float32) + 1.0) / 2.0, 1e-6, 1.0)
+
+
+def _diagnostic_contrast_similarity(query_sig, candidate_sigs):
+    query_profile = np.asarray(
+        [
+            query_sig[6],
+            query_sig[2],
+            query_sig[1],
+            query_sig[6] - query_sig[2],
+            query_sig[6] - max(query_sig[1], query_sig[2]),
+        ],
+        dtype=np.float32,
+    )
+    cand_profiles = np.stack(
+        [
+            candidate_sigs[:, 6],
+            candidate_sigs[:, 2],
+            candidate_sigs[:, 1],
+            candidate_sigs[:, 6] - candidate_sigs[:, 2],
+            candidate_sigs[:, 6] - np.maximum(candidate_sigs[:, 1], candidate_sigs[:, 2]),
+        ],
+        axis=1,
+    ).astype(np.float32)
+    weights = np.asarray([1.5, 0.8, 0.5, 1.2, 1.2], dtype=np.float32)
+    diff = np.abs(cand_profiles - query_profile[None, :])
+    return np.clip(1.0 - (diff @ weights) / weights.sum(), 0.0, 1.0)
+
+
+def _top_feature_proxy_similarity(query, candidates):
+    query = np.asarray(query, dtype=np.float32).reshape(-1)
+    candidates = np.asarray(candidates, dtype=np.float32)
+    n_top = max(8, min(32, query.shape[0] // 8))
+    q_top = np.argsort(np.abs(query))[::-1][:n_top]
+    q_mask = np.zeros(query.shape[0], dtype=bool)
+    q_mask[q_top] = True
+    sims = []
+    for cand in candidates:
+        c_top = np.argsort(np.abs(cand))[::-1][:n_top]
+        c_mask = np.zeros(cand.shape[0], dtype=bool)
+        c_mask[c_top] = True
+        inter = float(np.logical_and(q_mask, c_mask).sum())
+        union = float(np.logical_or(q_mask, c_mask).sum())
+        sims.append(inter / union if union else 0.0)
+    return np.asarray(sims, dtype=np.float32)
+
+
+def _build_diagnostic_quotient(embeddings, signatures):
+    probs = np.asarray(signatures[:, :N_CLASSES], dtype=np.float32)
+    probs = probs / np.maximum(probs.sum(axis=1, keepdims=True), 1e-8)
+    weights = probs.sum(axis=0)
+    center = embeddings.mean(axis=0, keepdims=True)
+    centroids = (probs.T @ embeddings) / np.maximum(weights[:, None], 1e-8)
+    directions = centroids - center
+    _, sigma, vt = np.linalg.svd(directions, full_matrices=False)
+    if sigma.size == 0:
+        return {"basis": np.zeros((embeddings.shape[1], 0), dtype=np.float32), "center": center[0], "scale": 1.0, "dim": 0}
+    tol = max(float(sigma.max()), 1.0) * 1e-5
+    rank = int(np.sum(sigma > tol))
+    rank = max(1, min(rank, N_CLASSES - 1, vt.shape[0]))
+    basis = vt[:rank].T.astype(np.float32)
+    coords = ((embeddings - center) @ basis).astype(np.float32)
+    coords = coords / np.maximum(coords.std(axis=0, keepdims=True), 1e-6)
+    diffs = coords[:, None, :] - coords[None, :, :]
+    dists = np.sqrt(np.maximum((diffs * diffs).sum(axis=-1), 0.0))
+    off_diag = dists[~np.eye(len(coords), dtype=bool)]
+    scale = float(np.median(off_diag)) if len(off_diag) else 1.0
+    return {
+        "basis": basis,
+        "center": center[0].astype(np.float32),
+        "coords": coords,
+        "scale": max(scale, 1e-3),
+        "dim": rank,
+    }
+
+
+def _diagnostic_quotient_similarity(query, quotient, candidate_indices):
+    if quotient.get("dim", 0) <= 0 or len(candidate_indices) == 0:
+        return np.ones(len(candidate_indices), dtype=np.float32)
+    q = ((query - quotient["center"]) @ quotient["basis"]).astype(np.float32)
+    std = np.maximum(quotient["coords"].std(axis=0), 1e-6)
+    q = q / std
+    c = quotient["coords"][candidate_indices]
+    diff = c - q[None, :]
+    dist2 = np.maximum((diff * diff).sum(axis=1), 0.0)
+    scale2 = max(float(quotient.get("scale", 1.0)) ** 2, 1e-6)
+    return np.exp(-dist2 / (2.0 * scale2)).astype(np.float32)
+
+
+def _candidate_mask_for_cost_aware(labels, signal, tier, exclude_index=None):
+    labels_arr = np.asarray(labels)
+    mask = np.ones(len(labels_arr), dtype=bool)
+    if exclude_index is not None and 0 <= exclude_index < len(mask):
+        mask[exclude_index] = False
+    if tier == "high":
+        return mask
+    ordered_probs = sorted(signal["probs"].items(), key=lambda kv: kv[1], reverse=True)
+    candidate_labels = {signal["pred_label"]}
+    if tier == "moderate":
+        candidate_labels.update([ordered_probs[0][0], ordered_probs[1][0]])
+        if signal["melanoma_probability"] >= 0.10:
+            candidate_labels.add("Melanoma")
+    routed = np.isin(labels_arr, list(candidate_labels))
+    if exclude_index is not None and 0 <= exclude_index < len(mask):
+        routed[exclude_index] = False
+    return routed
+
+
+def _bank_retrieval_signals(bank_key, bank, embeddings, registry):
+    case_ids = bank.get("case_ids", [])
+    cache_key = f"bank_signals|{bank_key}|{PHASE4_RETRIEVAL_PATH.stat().st_mtime if PHASE4_RETRIEVAL_PATH.exists() else 0}"
+    cached = _retrieval_signal_cache.get(cache_key)
+    if cached:
+        return cached
+
+    component_models = bank.get("component_models") or ([bank_key] if bank_key in MODEL_REGISTRY else [])
+    prediction_maps = {mkey: _load_retrieval_prediction_map(mkey) for mkey in component_models}
+    cases = registry.get("cases", {})
+    labels = []
+    signals = []
+    for sid in case_ids:
+        meta = cases.get(sid) or {}
+        true_label = meta.get("true_label")
+        labels.append(true_label or "Unknown")
+        probs_list = []
+        hard_flags = [bool(meta.get("is_hard_melanoma"))]
+        pred_labels = []
+        for mkey, pred_map in prediction_maps.items():
+            row = pred_map.get(sid)
+            if row:
+                probs_list.append(_prob_dict_from_row(row, fallback_label=true_label))
+                hard_flags.append(str(row.get("hard_case_candidate", "0")).lower() in {"1", "true", "yes"})
+                pred_labels.append(row.get("pred_label"))
+        if probs_list:
+            probs = {
+                cls: float(np.mean([p.get(cls, 0.0) for p in probs_list]))
+                for cls in CLASS_NAMES.values()
+            }
+        else:
+            probs = _prob_dict_from_row(None, fallback_label=true_label)
+        signal = _signal_from_prob_dict(probs, hard_case_candidate=any(hard_flags))
+        if pred_labels and len(component_models) == 1 and pred_labels[0]:
+            signal["pred_label"] = pred_labels[0]
+        signals.append(signal)
+
+    signatures = np.stack([_clinical_signature_from_signal(s) for s in signals], axis=0)
+    axes = np.stack([_pathology_axis_from_signal(s) for s in signals], axis=0)
+    risk_ranks = np.asarray([max(_signal_risk_rank(s), _label_risk_rank(lbl)) for s, lbl in zip(signals, labels)], dtype=np.int64)
+    quotient = _build_diagnostic_quotient(embeddings, signatures)
+    payload = {
+        "labels": labels,
+        "signals": signals,
+        "signatures": signatures,
+        "axes": axes,
+        "risk_ranks": risk_ranks,
+        "quotient": quotient,
+    }
+    _retrieval_signal_cache[cache_key] = payload
+    return payload
+
+
+def _cost_aware_component_scores(query, candidate_indices, embeddings, bank_signals, query_signal):
+    labels = np.asarray(bank_signals["labels"])
+    signatures = bank_signals["signatures"]
+    axes = bank_signals["axes"]
+    quotient = bank_signals["quotient"]
+    query_sig = _clinical_signature_from_signal(query_signal)
+    query_axis = _pathology_axis_from_signal(query_signal)
+    query_rank = _signal_risk_rank(query_signal)
+    emb_scores = _unit_similarity_from_dot(embeddings[candidate_indices] @ query)
+    quotient_scores = _diagnostic_quotient_similarity(query, quotient, candidate_indices)
+    clinical_scores = _clinical_similarity(query_sig, signatures[candidate_indices])
+    axis_scores = _pathology_axis_similarity(query_axis, axes[candidate_indices])
+    tile_scores = _top_feature_proxy_similarity(query, embeddings[candidate_indices])
+    contrast_scores = _diagnostic_contrast_similarity(query_sig, signatures[candidate_indices])
+    lattice_scores = _risk_lattice_similarity(query_rank, bank_signals["risk_ranks"][candidate_indices])
+    candidate_labels = labels[candidate_indices]
+    evidence_scores = np.full(len(candidate_indices), 0.62, dtype=np.float32)
+    evidence_scores[candidate_labels == query_signal["pred_label"]] = 0.86
+    if query_signal["melanoma_probability"] >= 0.20 or query_signal["pred_label"] == "Melanoma":
+        evidence_scores[candidate_labels == "Melanoma"] = 0.96
+    elif query_signal["melanoma_probability"] >= 0.10:
+        evidence_scores[candidate_labels == "Melanoma"] = 0.78
+    return {
+        "embedding": np.clip(emb_scores, 1e-6, 1.0),
+        "quotient": np.clip(quotient_scores, 1e-6, 1.0),
+        "clinical": np.clip(clinical_scores, 1e-6, 1.0),
+        "axis": np.clip(axis_scores, 1e-6, 1.0),
+        "tile": np.clip(tile_scores, 1e-6, 1.0),
+        "contrast": np.clip(contrast_scores, 1e-6, 1.0),
+        "lattice": np.clip(lattice_scores, 1e-6, 1.0),
+        "evidence": np.clip(evidence_scores, 1e-6, 1.0),
+    }
+
+
+def _cost_aware_weights(method):
+    if method == "aags_product_v1":
+        return {"embedding": 0.34, "clinical": 0.17, "axis": 0.14, "tile": 0.10, "contrast": 0.11, "lattice": 0.09, "evidence": 0.05}
+    if method == "aags_quotient_v2":
+        return {"embedding": 0.24, "quotient": 0.18, "clinical": 0.15, "axis": 0.13, "tile": 0.09, "contrast": 0.10, "lattice": 0.07, "evidence": 0.04}
+    if method == "trlq_tropical_v1":
+        return {"embedding": 0.36, "clinical": 0.15, "axis": 0.13, "tile": 0.09, "contrast": 0.12, "lattice": 0.10, "evidence": 0.05}
+    return {"embedding": 0.25, "quotient": 0.18, "clinical": 0.14, "axis": 0.12, "tile": 0.08, "contrast": 0.10, "lattice": 0.09, "evidence": 0.04}
+
+
+def _combine_cost_aware_scores(components, method):
+    weights = _cost_aware_weights(method)
+    if method.startswith("aags"):
+        scores = np.ones(len(next(iter(components.values()))), dtype=np.float32)
+        for key, weight in weights.items():
+            scores *= np.power(components[key], weight)
+        return scores
+    cost = np.zeros(len(next(iter(components.values()))), dtype=np.float32)
+    for key, weight in weights.items():
+        cost += weight * (-np.log(components[key]))
+    return -cost
+
+
+def _display_similarity_from_active_score(score, method):
+    score = float(score)
+    if method.startswith("trlq"):
+        return float(np.exp(score))
+    return float(np.clip(score, 0.0, 1.0))
+
+
+def _cost_aware_search(query, embeddings, case_ids, bank_signals, query_signal, exclude_index=None, top_k=5, method=None):
+    method = method or cfg.RETRIEVAL_ACTIVE_METHOD
+    labels = bank_signals["labels"]
+    tier = _risk_tier(query_signal)
+    mask = _candidate_mask_for_cost_aware(labels, query_signal, tier, exclude_index=exclude_index)
+    candidate_indices = np.flatnonzero(mask)
+    if len(candidate_indices) == 0:
+        return {"indices": [], "scores": np.asarray([], dtype=np.float32), "components": {}, "tier": tier, "cost": {}}
+
+    query_sig = _clinical_signature_from_signal(query_signal)
+    query_axis = _pathology_axis_from_signal(query_signal)
+    query_rank = _signal_risk_rank(query_signal)
+    signatures = bank_signals["signatures"]
+    axes = bank_signals["axes"]
+    quotient = bank_signals["quotient"]
+    candidate_labels = [labels[idx] for idx in candidate_indices]
+    clinical_scores = _clinical_similarity(query_sig, signatures[candidate_indices])
+    lattice_scores = _risk_lattice_similarity(query_rank, bank_signals["risk_ranks"][candidate_indices])
+    contrast_scores = _diagnostic_contrast_similarity(query_sig, signatures[candidate_indices])
+    quotient_scores = _diagnostic_quotient_similarity(query, quotient, candidate_indices)
+    label_bonus = _candidate_label_bonus(candidate_labels, query_signal, tier)
+    routing_scores = (
+        0.38 * clinical_scores +
+        0.20 * lattice_scores +
+        0.18 * contrast_scores +
+        0.14 * quotient_scores +
+        0.10 * label_bonus
+    )
+
+    if tier == "low":
+        budget = min(32, len(candidate_indices))
+        rerank_budget = min(14, budget)
+    elif tier == "moderate":
+        budget = min(80, len(candidate_indices))
+        rerank_budget = min(28, budget)
+    else:
+        budget = min(160, len(candidate_indices))
+        rerank_budget = min(54, budget)
+
+    preselect_local = np.argsort(routing_scores)[::-1][:budget]
+    preselect = candidate_indices[preselect_local]
+    preselect_routing = routing_scores[preselect_local]
+    emb_unit = _unit_similarity_from_dot(embeddings[preselect] @ query)
+    stage_scores = 0.58 * emb_unit + 0.42 * preselect_routing
+    rerank_local = np.argsort(stage_scores)[::-1][:rerank_budget]
+    rerank_indices = preselect[rerank_local]
+    components = _cost_aware_component_scores(query, rerank_indices, embeddings, bank_signals, query_signal)
+    final_scores = _combine_cost_aware_scores(components, method)
+    order_local = np.argsort(final_scores)[::-1]
+    ordered = rerank_indices[order_local].tolist()
+    ordered_scores = final_scores[order_local]
+
+    melanoma_guard = query_signal["pred_label"] != "Melanoma" and query_signal["melanoma_probability"] >= 0.20
+    extra_melanoma_scan = 0
+    if melanoma_guard and not any(labels[idx] == "Melanoma" for idx in ordered[:top_k]):
+        mel_mask = np.asarray(labels) == "Melanoma"
+        if exclude_index is not None and 0 <= exclude_index < len(mel_mask):
+            mel_mask[exclude_index] = False
+        mel_candidates = np.flatnonzero(mel_mask)
+        if len(mel_candidates):
+            mel_components = _cost_aware_component_scores(query, mel_candidates, embeddings, bank_signals, query_signal)
+            mel_scores = 0.45 * mel_components["embedding"] + 0.25 * mel_components["axis"] + 0.20 * mel_components["contrast"] + 0.10 * mel_components["lattice"]
+            best_mel = int(mel_candidates[int(np.argmax(mel_scores))])
+            if best_mel not in ordered:
+                ordered = ordered[: max(0, top_k - 1)] + [best_mel] + ordered[top_k - 1:]
+                ordered_scores = np.concatenate([ordered_scores[: max(0, top_k - 1)], np.asarray([float(np.max(mel_scores))], dtype=np.float32), ordered_scores[top_k - 1:]])
+            extra_melanoma_scan = int(len(mel_candidates))
+
+    signature_dim = signatures.shape[1]
+    axis_dim = axes.shape[1]
+    quotient_dim = int(quotient.get("dim", 0))
+    embedding_dim = embeddings.shape[1]
+    routing_equivalent = len(candidate_indices) * ((signature_dim + axis_dim + quotient_dim + 2) / max(embedding_dim, 1))
+    rerank_equivalent = rerank_budget * (0.45 + (axis_dim + quotient_dim) / max(embedding_dim, 1))
+    equivalent_cost = float(routing_equivalent + budget + rerank_equivalent + extra_melanoma_scan)
+    cost = {
+        "candidate_count": int(len(candidate_indices)),
+        "preselect_budget": int(budget),
+        "rerank_budget": int(rerank_budget),
+        "melanoma_guard_extra_scan": int(extra_melanoma_scan),
+        "embedding_dot_products_executed": int(budget + extra_melanoma_scan),
+        "equivalent_full_vector_comparisons": round(equivalent_cost, 4),
+        "routing_equivalent_comparisons": round(float(routing_equivalent), 4),
+        "rerank_equivalent_comparisons": round(float(rerank_equivalent), 4),
+    }
+    return {
+        "indices": ordered[:top_k],
+        "scores": ordered_scores[:top_k],
+        "components": components,
+        "component_indices": rerank_indices.tolist(),
+        "tier": tier,
+        "method": method,
+        "cost": cost,
+    }
+
+
+def _score_specific_candidates(query, embeddings, bank_signals, query_signal, candidate_indices, method):
+    if len(candidate_indices) == 0:
+        return np.asarray([], dtype=np.float32), {}
+    components = _cost_aware_component_scores(query, np.asarray(candidate_indices, dtype=np.int64), embeddings, bank_signals, query_signal)
+    scores = _combine_cost_aware_scores(components, method)
+    return scores, components
+
+
+def _format_component_snapshot(components, local_idx):
+    out = {}
+    for key, values in components.items():
+        try:
+            out[key] = round(float(values[local_idx]), 4)
+        except Exception:
+            pass
+    return out
+
+
+def _format_retrieval_case(case_meta, similarity, method="cosine", component_scores=None, rank_score=None):
+    similarity_value = round(float(similarity), 4)
     return {
         "slide_id": case_meta["slide_id"],
         "filename": case_meta.get("filename"),
         "true_label": case_meta.get("true_label"),
         "source": case_meta.get("source"),
-        "similarity": round(float(similarity), 4),
+        "similarity": similarity_value,
         "thumbnail_url": case_meta.get("thumbnail_url"),
         "is_hard_melanoma": bool(case_meta.get("is_hard_melanoma")),
+        "detail": {
+            "metric": method,
+            "score": similarity_value,
+            "rank_score": None if rank_score is None else round(float(rank_score), 4),
+            "component_scores": component_scores or {},
+            "formula": "TRLQ uses weighted tropical cost: score = exp(-sum_i w_i * -log(component_i)); AAGS uses product_i component_i^w_i.",
+            "computed_from": "Slide-level MIL bag embeddings, not raw pixels and not metadata.",
+            "interpretation": "Higher score means stronger agreement across embedding similarity, diagnostic quotient, clinical probability profile, risk lattice, melanoma contrast, and top-feature proxy.",
+            "medical_use": "Use as case-based evidence: compare morphology, predicted class, safety flags, and attention regions before trusting the analogy.",
+        },
     }
 
 
-def _retrieve_similar_cases(model_key, bag_embedding=None, ensemble_model_keys=None, ensemble_bag_embeddings=None, top_k=5, hard_top_k=3):
+def _retrieve_similar_cases(
+    model_key,
+    bag_embedding=None,
+    ensemble_model_keys=None,
+    ensemble_bag_embeddings=None,
+    probabilities=None,
+    safety=None,
+    query_slide_id=None,
+    top_k=5,
+    hard_top_k=3,
+):
     registry, arrays = _load_phase4_registry()
     banks = registry.get("banks", {})
     bank = banks.get(model_key)
@@ -1550,25 +2282,133 @@ def _retrieve_similar_cases(model_key, bag_embedding=None, ensemble_model_keys=N
 
     case_lookup = registry.get("cases", {})
     case_ids = bank.get("case_ids", [])
-    scores = embeddings @ query
-    order = np.argsort(scores)[::-1]
+    exhaustive_comparisons = int(len(case_ids))
+    embedding_dim = int(query.shape[0])
+    exclude_index = None
+    if query_slide_id and query_slide_id in case_ids:
+        exclude_index = case_ids.index(query_slide_id)
+
+    query_signal = _query_signal_from_result(probabilities, safety)
+    if query_signal is None:
+        query_signal = _signal_from_prob_dict(
+            {CLASS_NAMES[i]: 1.0 / N_CLASSES for i in range(N_CLASSES)},
+            pred_label=(safety or {}).get("raw_prediction"),
+            hard_case_candidate=bool((safety or {}).get("hard_case_candidate")),
+        )
+
+    bank_signals = _bank_retrieval_signals(model_key, bank, embeddings, registry)
+    active_method = cfg.RETRIEVAL_ACTIVE_METHOD
+    active = _cost_aware_search(
+        query,
+        embeddings,
+        case_ids,
+        bank_signals,
+        query_signal,
+        exclude_index=exclude_index,
+        top_k=top_k,
+        method=active_method,
+    )
+
+    method_summaries = {}
+    for method in ("macs_attention_v1", "aags_quotient_v2", "trlq_quotient_v2"):
+        if method == "macs_attention_v1":
+            # MACS is represented by the first routing+embedding stage; it is
+            # included as a cost comparator and fallback interpretation.
+            probe = _cost_aware_search(
+                query,
+                embeddings,
+                case_ids,
+                bank_signals,
+                query_signal,
+                exclude_index=exclude_index,
+                top_k=top_k,
+                method="aags_product_v1",
+            )
+            method_summaries[method] = {
+                "role": "clinical shortlist plus attention/pathology-aware rerank comparator",
+                "tier": probe.get("tier"),
+                "equivalent_full_vector_comparisons": probe.get("cost", {}).get("equivalent_full_vector_comparisons"),
+                "embedding_dot_products_executed": probe.get("cost", {}).get("embedding_dot_products_executed"),
+            }
+        else:
+            probe = active if method == active_method else _cost_aware_search(
+                query,
+                embeddings,
+                case_ids,
+                bank_signals,
+                query_signal,
+                exclude_index=exclude_index,
+                top_k=top_k,
+                method=method,
+            )
+            method_summaries[method] = {
+                "role": "active" if method == active_method else "available comparator",
+                "tier": probe.get("tier"),
+                "equivalent_full_vector_comparisons": probe.get("cost", {}).get("equivalent_full_vector_comparisons"),
+                "embedding_dot_products_executed": probe.get("cost", {}).get("embedding_dot_products_executed"),
+            }
+
+    baseline_cost = {
+        "method": "full_cosine_exhaustive",
+        "comparisons": exhaustive_comparisons - (1 if exclude_index is not None else 0),
+        "multiply_adds_estimate": int((exhaustive_comparisons - (1 if exclude_index is not None else 0)) * embedding_dim),
+        "complexity": "O(N * D) full embedding dot products plus sorting.",
+        "executed": False,
+        "note": "Shown as baseline cost only; the active UI path no longer executes full cosine search before retrieval.",
+    }
+    active_cost = active.get("cost", {})
+    active_equiv = float(active_cost.get("equivalent_full_vector_comparisons", exhaustive_comparisons) or exhaustive_comparisons)
 
     similar_cases = []
-    hard_cases = []
-    for idx in order:
+    active_component_index = {idx: pos for pos, idx in enumerate(active.get("component_indices", []))}
+    active_components = active.get("components", {})
+    for idx, rank_score in zip(active.get("indices", []), active.get("scores", [])):
         if idx >= len(case_ids):
             continue
         slide_id = case_ids[idx]
         case_meta = case_lookup.get(slide_id)
         if not case_meta:
             continue
-        item = _format_retrieval_case(case_meta, scores[idx])
-        if len(similar_cases) < top_k:
-            similar_cases.append(item)
-        if item["is_hard_melanoma"] and len(hard_cases) < hard_top_k:
-            hard_cases.append(item)
-        if len(similar_cases) >= top_k and len(hard_cases) >= hard_top_k:
-            break
+        local_idx = active_component_index.get(idx)
+        component_scores = _format_component_snapshot(active_components, local_idx) if local_idx is not None else {}
+        similar_cases.append(_format_retrieval_case(
+            case_meta,
+            _display_similarity_from_active_score(rank_score, active_method),
+            method=active_method,
+            component_scores=component_scores,
+            rank_score=rank_score,
+        ))
+
+    hard_indices = [
+        idx for idx, sid in enumerate(case_ids)
+        if idx != exclude_index and bool((case_lookup.get(sid) or {}).get("is_hard_melanoma"))
+    ]
+    hard_scores, hard_components = _score_specific_candidates(
+        query,
+        embeddings,
+        bank_signals,
+        query_signal,
+        hard_indices,
+        active_method,
+    )
+    hard_order = np.argsort(hard_scores)[::-1][:hard_top_k] if len(hard_scores) else []
+    hard_cases = []
+    for local_pos in hard_order:
+        idx = int(hard_indices[int(local_pos)])
+        slide_id = case_ids[idx]
+        case_meta = case_lookup.get(slide_id)
+        if not case_meta:
+            continue
+        hard_cases.append(_format_retrieval_case(
+            case_meta,
+            _display_similarity_from_active_score(hard_scores[int(local_pos)], active_method),
+            method=active_method,
+            component_scores=_format_component_snapshot(hard_components, int(local_pos)),
+            rank_score=hard_scores[int(local_pos)],
+        ))
+    hard_scan_count = int(len(hard_indices))
+    active_equiv_total = active_equiv + hard_scan_count
+    saved_equiv = max(float(baseline_cost["comparisons"]) - active_equiv_total, 0.0)
 
     return {
         "available": True,
@@ -1579,6 +2419,86 @@ def _retrieve_similar_cases(model_key, bag_embedding=None, ensemble_model_keys=N
         "hard_case_count": int(bank.get("hard_case_count", 0)),
         "similar_cases": similar_cases,
         "hard_melanoma_matches": hard_cases,
+        "details": {
+            "title": "Cost-aware pathology retrieval calculation",
+            "summary": "The retrieval panel now uses TRLQ/AAGS-style cost-aware pathology search instead of exhaustive cosine. It routes by cheap clinical/pathology signals, then spends full embedding comparisons only on a short candidate list.",
+            "clinical_context": [
+                "Similar cases are not additional labels. They are visual and statistical evidence that helps a reviewer ask whether the current slide resembles known BCC, SCC, melanoma, benign, or hard melanoma examples.",
+                "The hard-melanoma list is useful when the model predicts another class but the feature space still places the case near difficult melanoma examples.",
+                "The risk tier controls search breadth: high-risk or melanoma-borderline queries deliberately search more widely; low-risk queries spend less retrieval cost."
+            ],
+            "technical_context": [
+                "The query vector is the MIL bag embedding z for a single model. For an ensemble bank, normalized component embeddings are concatenated in the ensemble component order and normalized again.",
+                "Each bank vector was precomputed from the same feature extractor/MIL family, then L2-normalized before storage.",
+                "A cheap clinical signature p=[P(Normal),P(BCC),P(SCC),P(Melanoma),confidence,margin,P(Melanoma),entropy] and pathology axis vector are used to route candidates before full embedding scoring.",
+                "AAGS combines component similarities by a weighted product. TRLQ maps component similarities to tropical costs with -log and minimizes accumulated evidence penalty.",
+                "The active production path is TRLQ quotient v2; full cosine is retained only as a displayed baseline cost, not as the executed search."
+            ],
+            "metric": active_method,
+            "metric_formula": "TRLQ score(q,x)=exp(-sum_i w_i * -log(s_i(q,x))); AAGS score(q,x)=prod_i s_i(q,x)^w_i",
+            "query_embedding_dim": embedding_dim,
+            "ranking_rule": "Candidates are first routed by clinical/pathology signals, then reranked by TRLQ over embedding, diagnostic quotient, clinical profile, pathology axis, top-feature proxy, melanoma contrast, risk lattice, and label evidence.",
+            "cost": {
+                "active_runtime_mode": active_method,
+                "risk_tier": active.get("tier"),
+                "bank_size": exhaustive_comparisons,
+                "full_cosine_baseline_comparisons": baseline_cost["comparisons"],
+                "full_cosine_baseline_multiply_adds": baseline_cost["multiply_adds_estimate"],
+                "active_equivalent_full_vector_comparisons": round(active_equiv_total, 4),
+                "active_embedding_dot_products_executed": int((active_cost.get("embedding_dot_products_executed") or 0) + hard_scan_count),
+                "saved_equivalent_comparisons_vs_cosine": round(saved_equiv, 4),
+                "cost_ratio_vs_full_cosine": round(active_equiv_total / max(float(baseline_cost["comparisons"]), 1.0), 4),
+                "estimated_cost_reduction_percent": round(100.0 * saved_equiv / max(float(baseline_cost["comparisons"]), 1.0), 2),
+                "candidate_count_after_safe_routing": active_cost.get("candidate_count"),
+                "preselect_budget": active_cost.get("preselect_budget"),
+                "rerank_budget": active_cost.get("rerank_budget"),
+                "melanoma_guard_extra_scan": active_cost.get("melanoma_guard_extra_scan"),
+                "hard_melanoma_evidence_scan": hard_scan_count,
+                "baseline_note": baseline_cost["note"],
+            },
+            "method_comparison": method_summaries,
+            "formulae": [
+                "clinical_signature = [P(N), P(BCC), P(SCC), P(Mel), confidence, margin, P(Mel), entropy]",
+                "pathology_axis = [P(Mel), P(BCC)+P(SCC), P(N), 1-margin, entropy, hard_case_flag]",
+                "SAFE-R tier = high if melanoma guard / hard case / low confidence / low margin; moderate for borderline uncertainty; else low",
+                "routing_score = 0.38 clinical + 0.20 risk_lattice + 0.18 melanoma_contrast + 0.14 diagnostic_quotient + 0.10 label_bonus",
+                "stage_score = 0.58 embedding_similarity + 0.42 routing_score",
+                "MACS = SAFE-R candidate routing + clinical/pathology preselection + embedding rerank on the shortlist",
+                "AAGS = product_i component_i ^ weight_i",
+                "TRLQ = exp(-sum_i weight_i * (-log(component_i)))",
+                "full_cosine_cost = N * D multiply-adds",
+                "active_cost ~= routed_low_dim_cost + preselect_embedding_dots + rerank_component_cost + melanoma_guard_scan",
+            ],
+            "score_distribution": {
+                "max": max((c["similarity"] for c in similar_cases), default=None),
+                "mean": round(float(np.mean([c["similarity"] for c in similar_cases])), 4) if similar_cases else None,
+                "min": min((c["similarity"] for c in similar_cases), default=None),
+            },
+            "steps": [
+                "Build query embedding from the selected model output.",
+                "L2-normalize the query embedding.",
+                "Build query clinical signature, pathology axis, melanoma contrast and risk-lattice rank from the model probabilities and safety flags.",
+                "Use SAFE-R routing to choose a low/moderate/high risk candidate pool.",
+                "Use cheap routing scores to preselect a short list instead of scoring every bank embedding.",
+                "Run TRLQ quotient v2 on the shortlist and return the top similar cases.",
+                "Run a hard-melanoma evidence pass so dangerous analogues remain visible.",
+            ],
+            "replication_steps": [
+                "Run the same encoder and MIL model on the query WSI to obtain bag embedding z.",
+                "Normalize z with L2 norm.",
+                "Load the selected bank embedding matrix E with shape [N, D].",
+                "Load phase1_test_predictions.csv for the same bank to build clinical signatures for each reference case.",
+                "Compute SAFE-R tier and candidate mask from query probabilities and melanoma safety flags.",
+                "Compute routing scores on low-dimensional signatures.",
+                "Compute full embedding/component scores only for the preselected shortlist.",
+                "Rank by active TRLQ score and map indices back to case metadata."
+            ],
+            "limitations": [
+                "Cost numbers are equivalent full-vector comparisons; low-dimensional routing operations are converted to comparable units for transparency.",
+                "A retrieved case supports explanation and review; it is not a ground-truth diagnosis for the current WSI.",
+                "TRLQ/AAGS are pathology-specific because their components depend on melanoma probability, diagnostic quotient, risk lattice and differential diagnosis structure."
+            ],
+        },
     }
 
 
@@ -1611,6 +2531,267 @@ def _build_result_artifacts(job_id, result):
         "tile_base_url": f"/api/results/{job_id}/tiles",
         "export_url": f"/api/results/{job_id}/export",
     }
+
+
+def _build_result_calculation_details(result, slide_info):
+    probabilities = result.get("probabilities") or {}
+    sorted_probs = sorted(probabilities.items(), key=lambda kv: kv[1], reverse=True)
+    top1 = sorted_probs[0] if sorted_probs else (None, 0.0)
+    top2 = sorted_probs[1] if len(sorted_probs) > 1 else (None, 0.0)
+    margin = float(top1[1]) - float(top2[1])
+    safety = result.get("safety") or {}
+    retrieval = result.get("retrieval") or {}
+    heatmap_views = result.get("heatmap_views") or []
+    top_tiles = result.get("top_tiles") or []
+    ensemble_details = result.get("ensemble_details") or []
+    model_key = result.get("model_key")
+    if model_key in ENSEMBLE_PRESETS:
+        model_kind = "ensemble"
+        model_components = ENSEMBLE_PRESETS[model_key].get("models", [])
+        model_feature_dim = "concatenated component bag embeddings"
+    else:
+        model_cfg = MODEL_REGISTRY.get(model_key, {})
+        model_kind = model_cfg.get("type", "unknown")
+        model_components = []
+        model_feature_dim = model_cfg.get("feat_dim")
+    width = slide_info.get("width")
+    height = slide_info.get("height")
+    mpp = slide_info.get("mpp")
+    physical_width_mm = round((float(width) * float(mpp)) / 1000.0, 2) if width and mpp else None
+    physical_height_mm = round((float(height) * float(mpp)) / 1000.0, 2) if height and mpp else None
+
+    details = {
+        "mode": "demo_audit",
+        "summary": "Collapsed details for explaining how each visible result was computed.",
+        "pipeline": {
+            "title": "End-to-end analysis pipeline",
+            "summary": "This pipeline treats one whole-slide image as one slide-level diagnostic bag: many tissue tiles go in, one calibrated slide prediction plus safety and retrieval evidence comes out.",
+            "clinical_context": [
+                "The input is a digitized dermatopathology whole-slide image, typically an H&E-stained skin tissue section scanned at high resolution.",
+                "The four displayed classes are Normal/Benign, basal cell carcinoma (BCC), squamous cell carcinoma (SCC), and melanoma.",
+                "Because melanoma false negatives are clinically more dangerous than many false positives, the pipeline includes safety logic after classification."
+            ],
+            "technical_context": [
+                "OpenSlide reads WSI metadata and pixel regions without loading the entire slide into memory.",
+                "Tissue-containing tiles are sampled from the WSI, embedded by the selected foundation/CNN encoder, and aggregated by a gated-attention MIL classifier.",
+                "Post-processing adds calibrated safety, OOD estimation, attention visualization, and case-based retrieval."
+            ],
+            "stages": [
+                {
+                    "stage": "OpenSlide metadata",
+                    "description": "Read slide dimensions, scanner metadata, pyramid levels, and microns-per-pixel. This defines the coordinate system used by tiles and heatmaps.",
+                    "outputs": {
+                        "width": slide_info.get("width"),
+                        "height": slide_info.get("height"),
+                        "mpp": slide_info.get("mpp"),
+                        "physical_width_mm_estimate": physical_width_mm,
+                        "physical_height_mm_estimate": physical_height_mm,
+                        "levels": slide_info.get("level_count"),
+                        "vendor": slide_info.get("vendor"),
+                    },
+                },
+                {
+                    "stage": "Tile extraction",
+                    "description": "The WSI is too large for a classifier directly, so it is converted into a bag of tissue tiles. Background-heavy tiles are dropped.",
+                    "formula": "keep tile if tissue_fraction >= MIN_TISSUE_FRACTION; use at most MAX_TILES_FOR_ANALYSIS tiles",
+                    "inputs": {
+                        "wsi_width": width,
+                        "wsi_height": height,
+                    },
+                    "outputs": {
+                        "tile_size": cfg.TILE_SIZE,
+                        "min_tissue_fraction": cfg.MIN_TISSUE_FRACTION,
+                        "max_tiles_for_analysis": cfg.MAX_TILES_FOR_ANALYSIS,
+                        "tiles_used": result.get("n_tiles"),
+                    },
+                },
+                {
+                    "stage": "Feature extraction",
+                    "description": "Each retained RGB tile is transformed into a dense vector by the selected visual encoder. These vectors are the model's numerical view of tissue morphology.",
+                    "formula": "tile RGB image -> encoder -> feature vector f_i",
+                    "outputs": {
+                        "model": result.get("model_used"),
+                        "model_key": result.get("model_key"),
+                        "model_kind": model_kind,
+                        "feature_dim": model_feature_dim,
+                        "ensemble_components": model_components,
+                    },
+                },
+                {
+                    "stage": "MIL aggregation",
+                    "description": "Multiple Instance Learning aggregates many tile vectors into a single slide vector while learning which tiles deserve more weight.",
+                    "formula": "h_i = encoder_head(f_i); a_i = softmax(W(tanh(Vh_i) * sigmoid(Uh_i))); z = sum_i a_i h_i; logits = classifier(z)",
+                    "outputs": {
+                        "prediction": result.get("raw_prediction"),
+                        "display_prediction": result.get("prediction"),
+                    },
+                },
+                {
+                    "stage": "Safety layer",
+                    "description": "The safety layer converts raw class probabilities into review-aware signals: uncertainty, narrow class margin, OOD shift, melanoma risk, and optional ensemble disagreement.",
+                    "formula": "safety_score = mean(uncertainty, 1 - margin, OOD score, optional ensemble disagreement)",
+                    "outputs": {
+                        "risk_level": safety.get("risk_level"),
+                        "decision_status": safety.get("decision_status"),
+                        "safety_score": safety.get("safety_score"),
+                    },
+                },
+                {
+                    "stage": "Retrieval",
+                    "description": "The final slide embedding is compared with a reference bank to retrieve similar historical/research cases for explanation.",
+                    "formula": retrieval.get("details", {}).get("metric_formula"),
+                    "outputs": {
+                        "bank": retrieval.get("bank_display") or retrieval.get("bank_key"),
+                        "bank_size": retrieval.get("bank_size"),
+                        "top_k": len(retrieval.get("similar_cases") or []),
+                    },
+                },
+            ],
+            "replication_steps": [
+                "Open the WSI with OpenSlide and record dimensions/mpp.",
+                "Extract 256x256 tissue tiles and discard tiles below the tissue-fraction threshold.",
+                "Encode each tile with the selected model family.",
+                "Run the gated-attention MIL head to obtain probabilities, attention, and bag embedding.",
+                "Apply safety, OOD, retrieval, and visualization post-processing."
+            ],
+        },
+        "prediction": {
+            "title": "Prediction calculation",
+            "summary": "The prediction is the highest-probability class after the MIL model converts all selected tissue tiles into one slide-level probability vector.",
+            "clinical_context": [
+                "The displayed class is a decision-support output for the whole slide, not a substitute for a pathologist's final report.",
+                "BCC, SCC, and melanoma can share visual patterns in some regions, so the probability margin is shown to expose close differential diagnoses."
+            ],
+            "technical_context": [
+                "The model produces one logit per class. Softmax converts logits into probabilities that sum to 1.",
+                "The raw prediction is argmax(probabilities). The displayed prediction can be overridden to Needs Expert Review by the safety layer."
+            ],
+            "formulae": [
+                "P(class_i) = exp(logit_i) / sum_j exp(logit_j)",
+                "prediction = argmax(P(class))",
+                "confidence = max(P(class))",
+                "margin = top1_probability - top2_probability",
+                "display_prediction may be replaced by Needs Expert Review when safety abstain triggers",
+            ],
+            "inputs": {
+                "probabilities": probabilities,
+                "top1_class": top1[0],
+                "top1_probability": round(float(top1[1]), 4),
+                "top2_class": top2[0],
+                "top2_probability": round(float(top2[1]), 4),
+                "margin": round(margin, 4),
+            },
+            "outputs": {
+                "raw_prediction": result.get("raw_prediction"),
+                "display_prediction": result.get("prediction"),
+                "decision_status": result.get("decision_status"),
+            },
+            "replication_steps": [
+                "Collect the slide-level probability vector returned by MIL inference.",
+                "Sort classes by probability.",
+                "Use the highest-probability class as raw_prediction.",
+                "Compute confidence and margin from the sorted probabilities.",
+                "Pass raw_prediction and probabilities through the safety layer before displaying the final label."
+            ],
+            "limitations": [
+                "A high probability means model confidence, not guaranteed biological truth.",
+                "A low margin means the model sees evidence for multiple diagnostic classes and should be interpreted cautiously."
+            ],
+        },
+        "attention": {
+            "title": "Attention heatmap and top tile calculation",
+            "summary": "Attention explains which tissue tiles most influenced the MIL bag representation used for slide classification.",
+            "clinical_context": [
+                "High-attention tiles should be reviewed as candidate diagnostically informative regions, such as tumor nests, atypical melanocytic proliferation, keratinizing squamous areas, or other discriminative morphology.",
+                "Attention is not a pixel-level tumor segmentation mask; it is a model-weighted importance map at tile level."
+            ],
+            "technical_context": [
+                "The MIL head uses gated attention: tanh and sigmoid gates are multiplied, projected to one score per tile, and normalized with softmax across the bag.",
+                "For ensemble mode, consensus/shared attention is derived from component attention maps so the displayed regions represent agreement across models."
+            ],
+            "formulae": [
+                "h_i = ReLU(W_encoder f_i + b_encoder)",
+                "raw_attention_i = W_attn(tanh(V h_i) * sigmoid(U h_i))",
+                "a_i = softmax(raw_attention_i over all tiles in the slide bag)",
+                "z = sum_i a_i h_i",
+                "visual_attention_i = minmax(a_i) for heatmap display",
+                "top tiles are sorted by the active attention/shared-attention score",
+                "heatmap stamps each tile score back onto a low-resolution WSI thumbnail",
+            ],
+            "inputs": {
+                "top_tiles_mode": result.get("top_tiles_mode"),
+                "heatmap_views": [view.get("key") for view in heatmap_views],
+                "default_heatmap_view": result.get("default_heatmap_view"),
+            },
+            "outputs": {
+                "top_tile_count": len(top_tiles),
+                "heatmap_available": result.get("heatmap_available"),
+                "top_tiles_title": result.get("top_tiles_title"),
+            },
+            "replication_steps": [
+                "Keep the attention vector returned by the MIL forward pass.",
+                "Normalize attention scores for visualization.",
+                "Sort tile indices by the selected attention view.",
+                "Save top tile crops and overlay the tile scores on a downsampled WSI thumbnail."
+            ],
+            "limitations": [
+                "Attention highlights influential tiles, not necessarily all tumor tissue.",
+                "A low-attention tile can still contain clinically relevant tissue; this is an explanation layer, not an exhaustive pathology annotation."
+            ],
+        },
+    }
+
+    if ensemble_details:
+        vote_counts = {}
+        for model_result in ensemble_details:
+            pred = model_result.get("prediction")
+            vote_counts[pred] = vote_counts.get(pred, 0) + 1
+        majority_count = max(vote_counts.values()) if vote_counts else 0
+        details["ensemble"] = {
+            "title": "Ensemble aggregation calculation",
+            "summary": "The ensemble combines multiple trained MIL models by averaging their probability vectors and reporting disagreement as a safety signal.",
+            "clinical_context": [
+                "Ensembling is useful when model families emphasize different histologic cues. Agreement raises confidence; disagreement exposes ambiguous or borderline morphology.",
+                "A melanoma-sensitive ensemble can still abstain when one or more components produce clinically relevant melanoma evidence."
+            ],
+            "technical_context": [
+                "Each component model runs its own encoder and MIL head on the same tile bag.",
+                "The final probability vector is an arithmetic mean of component probabilities; the vote count is shown only as an interpretability aid.",
+                "Ensemble disagreement is used by safety scoring because disagreement often correlates with uncertain decision boundaries."
+            ],
+            "formulae": [
+                "P_ensemble(class) = mean(P_model_1(class), ..., P_model_n(class))",
+                "ensemble_prediction = argmax(P_ensemble(class))",
+                "majority_vote = most frequent per-model predicted class",
+                "ensemble_disagreement = 1 - majority_vote_count / number_of_models",
+            ],
+            "inputs": {
+                "models": [m.get("model") for m in ensemble_details],
+                "per_model_predictions": {
+                    m.get("model"): m.get("prediction") for m in ensemble_details
+                },
+                "per_model_probabilities": {
+                    m.get("model"): m.get("probabilities") for m in ensemble_details
+                },
+            },
+            "outputs": {
+                "ensemble_probabilities": probabilities,
+                "ensemble_prediction": result.get("raw_prediction"),
+                "display_prediction": result.get("prediction"),
+                "vote_counts": vote_counts,
+                "majority_vote_count": majority_count,
+                "ensemble_disagreement": safety.get("ensemble_disagreement"),
+            },
+            "replication_steps": [
+                "Run each listed model on the same extracted tile bag.",
+                "Store each model's class probabilities and argmax class.",
+                "Average probabilities class-wise.",
+                "Compute the ensemble argmax from averaged probabilities.",
+                "Compute disagreement from per-model votes and pass it to the safety layer."
+            ],
+        }
+
+    return details
 
 
 def _build_phase1_safety(prediction, probabilities, ensemble_predictions=None):
@@ -1678,6 +2859,62 @@ def _build_phase1_safety(prediction, probabilities, ensemble_predictions=None):
         decision_status = 'predicted'
         prediction_key = CLASS_KEYS[int(prediction)]
 
+    phase1_detail = {
+        "title": "Phase 1 melanoma-sensitive safety calculation",
+        "summary": "Phase 1 is a melanoma false-negative guard. It checks whether the raw predicted class should be trusted or converted into an expert-review recommendation.",
+        "clinical_context": [
+            "A missed melanoma is clinically more dangerous than sending an uncertain case to review, so melanoma probability receives asymmetric treatment.",
+            "The guard is most relevant when the raw top class is BCC, SCC, or benign but P(Melanoma) remains above a borderline threshold."
+        ],
+        "technical_context": [
+            "Uncertainty is normalized entropy, so it is comparable across the four-class output.",
+            "Margin measures how separated the top two classes are; small margin means the classifier is close to changing its decision.",
+            "The abstain rule is intentionally conjunctive: melanoma evidence must be present, then at least one weakness signal must make automatic finalization unsafe."
+        ],
+        "formulae": [
+            "confidence = max(P(class))",
+            "margin = top1_probability - top2_probability",
+            "uncertainty = -sum_i p_i log(p_i) / log(number_of_classes)",
+            f"melanoma_first_guard = raw_prediction != Melanoma and P(Melanoma) >= {cfg.MELANOMA_BORDERLINE_PROB:.2f}",
+            f"abstain = melanoma_first_guard and (confidence < 0.75 or uncertainty >= {cfg.MODERATE_UNCERTAINTY_THRESHOLD:.2f} or margin < 0.22 or ensemble_disagreement >= {cfg.ENSEMBLE_DISAGREEMENT_THRESHOLD:.2f})",
+        ],
+        "inputs": {
+            "raw_prediction": raw_prediction,
+            "top1_class": CLASS_NAMES[int(order[0])],
+            "top1_probability": round(top1, 4),
+            "top2_class": CLASS_NAMES[int(order[1])] if len(order) > 1 else None,
+            "top2_probability": round(top2, 4),
+            "margin": round(margin, 4),
+            "uncertainty": round(entropy_norm, 4),
+            "melanoma_probability": round(melanoma_prob, 4),
+            "ensemble_disagreement": None if disagreement is None else round(disagreement, 4),
+        },
+        "thresholds": {
+            "abstain_confidence": cfg.ABSTAIN_CONFIDENCE_THRESHOLD,
+            "high_uncertainty": cfg.HIGH_UNCERTAINTY_THRESHOLD,
+            "moderate_uncertainty": cfg.MODERATE_UNCERTAINTY_THRESHOLD,
+            "low_margin": cfg.LOW_MARGIN_THRESHOLD,
+            "melanoma_borderline_probability": cfg.MELANOMA_BORDERLINE_PROB,
+            "melanoma_high_risk_probability": cfg.MELANOMA_HIGH_RISK_PROB,
+            "ensemble_disagreement": cfg.ENSEMBLE_DISAGREEMENT_THRESHOLD,
+        },
+        "outputs": {
+            "melanoma_first_guard": melanoma_first_guard,
+            "abstain_recommended": abstain_recommended,
+            "risk_level": risk_level,
+            "decision_status": decision_status,
+            "display_prediction": display_prediction,
+            "reasons": reasons,
+        },
+        "replication_steps": [
+            "Sort the four class probabilities.",
+            "Compute confidence from the top probability and margin from the top-two difference.",
+            "Compute normalized entropy over all class probabilities.",
+            "Check melanoma_first_guard using P(Melanoma) and raw_prediction.",
+            "If the melanoma guard is active and confidence/margin/uncertainty/disagreement is unsafe, set decision_status to abstain."
+        ],
+    }
+
     return {
         'raw_prediction': raw_prediction,
         'display_prediction': display_prediction,
@@ -1694,6 +2931,9 @@ def _build_phase1_safety(prediction, probabilities, ensemble_predictions=None):
         'recommendation': recommendation,
         'reasons': reasons,
         'hard_case_candidate': bool(melanoma_first_guard or (raw_prediction == 'Melanoma' and top1 < 0.75)),
+        'details': {
+            'phase1': phase1_detail,
+        },
     }
 
 
@@ -2296,4 +3536,3 @@ if __name__ == "__main__":
     logger.info(f"  Classes: {', '.join(CLASS_NAMES.values())}")
     logger.info(f"  Ensemble: {', '.join(MODEL_REGISTRY[m]['name'] for m in ENSEMBLE_MODELS)}")
     app.run(host="0.0.0.0", port=port, debug=debug, threaded=True)
-

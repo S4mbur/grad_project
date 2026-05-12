@@ -216,6 +216,154 @@ function formatThresholdPolicy(policy) {
     return parts.join(' | ');
 }
 
+function escapeHtml(value) {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function formatDetailValue(value) {
+    if (value === null || value === undefined) return 'N/A';
+    if (typeof value === 'number') {
+        if (!Number.isFinite(value)) return 'N/A';
+        if (Number.isInteger(value)) return value.toLocaleString();
+        if (Math.abs(value) <= 1) {
+            return `${value.toFixed(4)} <span class="calc-muted">(${(value * 100).toFixed(1)}%)</span>`;
+        }
+        return value.toFixed(4);
+    }
+    if (typeof value === 'boolean') return value ? 'true' : 'false';
+    if (Array.isArray(value)) {
+        if (!value.length) return '[]';
+        return `<ul class="calc-list">${value.map(v => `<li>${formatDetailValue(v)}</li>`).join('')}</ul>`;
+    }
+    if (typeof value === 'object') {
+        return `<pre class="calc-json">${escapeHtml(JSON.stringify(value, null, 2))}</pre>`;
+    }
+    return escapeHtml(value);
+}
+
+function renderKeyValueTable(title, obj) {
+    if (!obj || !Object.keys(obj).length) return '';
+    const rows = Object.entries(obj).map(([key, value]) => `
+        <div class="calc-kv-row">
+            <span>${escapeHtml(key.replaceAll('_', ' '))}</span>
+            <strong>${formatDetailValue(value)}</strong>
+        </div>
+    `).join('');
+    return `
+        <div class="calc-subtitle">${escapeHtml(title)}</div>
+        <div class="calc-kv">${rows}</div>
+    `;
+}
+
+function renderFormulaList(formulae) {
+    if (!formulae || !formulae.length) return '';
+    return `
+        <div class="calc-subtitle">Formula / rule</div>
+        <ul class="calc-formulae">
+            ${formulae.map(f => `<li><code>${escapeHtml(f)}</code></li>`).join('')}
+        </ul>
+    `;
+}
+
+function renderTextList(title, items) {
+    if (!items || !items.length) return '';
+    const normalized = Array.isArray(items) ? items : [items];
+    return `
+        <div class="calc-subtitle">${escapeHtml(title)}</div>
+        <ul class="calc-list">
+            ${normalized.map(item => `<li>${escapeHtml(item)}</li>`).join('')}
+        </ul>
+    `;
+}
+
+function renderComponentList(components) {
+    if (!components || !components.length) return '';
+    return `
+        <div class="calc-subtitle">Components</div>
+        <div class="calc-components">
+            ${components.map(c => `
+                <div class="calc-component">
+                    <div>
+                        <strong>${escapeHtml(c.name || 'component')}</strong>
+                        <span>${escapeHtml(c.meaning || '')}</span>
+                    </div>
+                    <b>${formatDetailValue(c.value)}</b>
+                </div>
+            `).join('')}
+        </div>
+    `;
+}
+
+function renderStageList(stages) {
+    if (!stages || !stages.length) return '';
+    return `
+        <div class="calc-subtitle">Stages</div>
+        <ol class="calc-stages">
+            ${stages.map(stage => `
+                <li>
+                    <strong>${escapeHtml(stage.stage || stage.title || 'Stage')}</strong>
+                    ${stage.description ? `<p class="calc-note">${escapeHtml(stage.description)}</p>` : ''}
+                    ${stage.formula ? `<code>${escapeHtml(stage.formula)}</code>` : ''}
+                    ${stage.inputs ? renderKeyValueTable('Inputs', stage.inputs) : ''}
+                    ${stage.outputs ? renderKeyValueTable('Outputs', stage.outputs) : ''}
+                    ${stage.notes ? renderTextList('Notes', stage.notes) : ''}
+                </li>
+            `).join('')}
+        </ol>
+    `;
+}
+
+function renderCalculationDetail(detail) {
+    if (!detail) return '';
+    return `
+        <div class="calc-card">
+            ${detail.title ? `<div class="calc-title">${escapeHtml(detail.title)}</div>` : ''}
+            ${detail.summary ? `<p class="calc-note">${escapeHtml(detail.summary)}</p>` : ''}
+            ${renderTextList('Clinical context', detail.clinical_context || detail.medical_context)}
+            ${renderTextList('Technical context', detail.technical_context)}
+            ${renderFormulaList(detail.formulae)}
+            ${detail.metric_formula ? renderFormulaList([detail.metric_formula]) : ''}
+            ${(detail.metric || detail.query_embedding_dim) ? renderKeyValueTable('Parameters', {
+                metric: detail.metric,
+                query_embedding_dim: detail.query_embedding_dim,
+            }) : ''}
+            ${renderStageList(detail.stages)}
+            ${detail.steps ? renderStageList(detail.steps.map(s => ({ stage: s }))) : ''}
+            ${renderComponentList(detail.components)}
+            ${renderKeyValueTable('Inputs', detail.inputs)}
+            ${renderKeyValueTable('Thresholds', detail.thresholds)}
+            ${renderKeyValueTable('Cost', detail.cost)}
+            ${renderKeyValueTable('Method comparison', detail.method_comparison)}
+            ${renderKeyValueTable('Score distribution', detail.score_distribution)}
+            ${renderKeyValueTable('OOD', detail.ood)}
+            ${renderKeyValueTable('Outputs', detail.outputs)}
+            ${renderTextList('How to reproduce', detail.replication_steps)}
+            ${renderTextList('Implementation notes', detail.implementation_notes)}
+            ${renderTextList('Limitations', detail.limitations)}
+            ${detail.ranking_rule ? `<p class="calc-note"><strong>Ranking:</strong> ${escapeHtml(detail.ranking_rule)}</p>` : ''}
+            ${detail.note ? `<p class="calc-note">${escapeHtml(detail.note)}</p>` : ''}
+        </div>
+    `;
+}
+
+function setCalculationDetails(blockId, contentId, html) {
+    const block = document.getElementById(blockId);
+    const content = document.getElementById(contentId);
+    if (!block || !content) return;
+    if (!html) {
+        block.style.display = 'none';
+        content.innerHTML = '';
+        return;
+    }
+    block.style.display = 'block';
+    content.innerHTML = html;
+}
+
 function getModelDisplayName(key) {
     const ensemble = state.modelsData?.ensembles?.find(e => e.key === key);
     if (ensemble) return ensemble.name;
@@ -334,6 +482,7 @@ function onAnalysisComplete(jobId, data) {
     animateProbBar('bcc', probs['BCC'] || 0);
     animateProbBar('scc', probs['SCC'] || 0);
     animateProbBar('melanoma', probs['Melanoma'] || 0);
+    renderPredictionDetails(result);
 
     // Ensemble details
     const ensembleDiv = document.getElementById('ensemble-details');
@@ -352,8 +501,10 @@ function onAnalysisComplete(jobId, data) {
                 </div>
             `;
         }).join('');
+        renderEnsembleCalculationDetails(result);
     } else {
         ensembleDiv.style.display = 'none';
+        setCalculationDetails('ensemble-details-block', 'ensemble-calculation-details', '');
     }
 
     // Stats
@@ -362,10 +513,12 @@ function onAnalysisComplete(jobId, data) {
         ? Math.round((Date.now() - state.analysisStartTime) / 1000) + 's'
         : '—';
     document.getElementById('stat-time').textContent = elapsed;
+    renderPipelineDetails(result);
 
     // Top tiles
     document.getElementById('top-tiles-title').textContent = result.top_tiles_title || 'Top Attention Tiles';
     renderTopTiles(result.top_tiles || [], jobId);
+    renderAttentionDetails(result);
     renderRetrievalPanel(result.retrieval || null);
 
     // Init viewer
@@ -424,6 +577,7 @@ function renderSafetyPanel(safety) {
     const panel = document.getElementById('safety-panel');
     if (!panel || !safety) {
         if (panel) panel.style.display = 'none';
+        setCalculationDetails('safety-details-block', 'safety-details', '');
         return;
     }
 
@@ -495,6 +649,54 @@ function renderSafetyPanel(safety) {
     document.getElementById('safety-flags').innerHTML = flags
         .map(flag => `<span class="safety-flag">${flag}</span>`)
         .join('');
+
+    renderSafetyDetails(safety);
+}
+
+function renderSafetyDetails(safety) {
+    const details = safety?.details || {};
+    const html = [
+        renderCalculationDetail(details.phase1),
+        renderCalculationDetail(details.phase2),
+        renderCalculationDetail(details.threshold_policy),
+    ].filter(Boolean).join('');
+    setCalculationDetails('safety-details-block', 'safety-details', html);
+}
+
+function renderPredictionDetails(result) {
+    const detail = result?.calculation_details?.prediction;
+    setCalculationDetails(
+        'prediction-details-block',
+        'prediction-details',
+        renderCalculationDetail(detail)
+    );
+}
+
+function renderEnsembleCalculationDetails(result) {
+    const detail = result?.calculation_details?.ensemble;
+    setCalculationDetails(
+        'ensemble-details-block',
+        'ensemble-calculation-details',
+        renderCalculationDetail(detail)
+    );
+}
+
+function renderPipelineDetails(result) {
+    const detail = result?.calculation_details?.pipeline;
+    setCalculationDetails(
+        'pipeline-details-block',
+        'pipeline-details',
+        renderCalculationDetail(detail)
+    );
+}
+
+function renderAttentionDetails(result) {
+    const detail = result?.calculation_details?.attention;
+    setCalculationDetails(
+        'attention-details-block',
+        'attention-details',
+        renderCalculationDetail(detail)
+    );
 }
 
 // ─────────────────── Top Tiles ─────────────────────────
@@ -546,11 +748,13 @@ function renderRetrievalPanel(retrieval) {
         grid.innerHTML = '';
         hardGrid.innerHTML = '';
         hardTitle.style.display = 'none';
+        setCalculationDetails('retrieval-details-block', 'retrieval-details', '');
         return;
     }
 
     panel.style.display = 'block';
     summary.textContent = `${retrieval.bank_display || retrieval.bank_key} • ${retrieval.bank_size || 0} reference cases • ${retrieval.hard_case_count || 0} hard melanoma cases`;
+    renderRetrievalDetails(retrieval);
     grid.innerHTML = _renderRetrievalCards(retrieval.similar_cases || [], 'No similar cases available.');
 
     const hardCases = retrieval.hard_melanoma_matches || [];
@@ -558,6 +762,15 @@ function renderRetrievalPanel(retrieval) {
     hardGrid.innerHTML = hardCases.length
         ? _renderRetrievalCards(hardCases, '')
         : '';
+}
+
+function renderRetrievalDetails(retrieval) {
+    const detail = retrieval?.details;
+    setCalculationDetails(
+        'retrieval-details-block',
+        'retrieval-details',
+        renderCalculationDetail(detail)
+    );
 }
 
 function _renderRetrievalCards(items, emptyText = '') {
@@ -587,6 +800,12 @@ function _renderRetrievalCards(items, emptyText = '') {
                 <div class="retrieval-actions">
                     <button class="retrieval-compare-btn" type="button" onclick="compareRetrievedCase('${item.slide_id}')">Compare</button>
                 </div>
+                ${item.detail ? `
+                    <details class="retrieval-card-detail">
+                        <summary>Similarity details</summary>
+                        ${renderKeyValueTable('Score calculation', item.detail)}
+                    </details>
+                ` : ''}
             </div>
         </div>
     `).join('');
@@ -622,6 +841,14 @@ function _renderCompareTiles(tiles) {
 
 function _renderCompareSummary(title, meta, jobId, resultLike, preferredVariant) {
     const safety = resultLike.safety || {};
+    const details = resultLike.calculation_details || {};
+    const detailHtml = [
+        renderCalculationDetail(details.prediction),
+        renderCalculationDetail(details.ensemble),
+        renderCalculationDetail(safety.details?.phase1),
+        renderCalculationDetail(safety.details?.phase2),
+        renderCalculationDetail(details.attention),
+    ].filter(Boolean).join('');
     return `
         <div class="compare-column">
             <div class="compare-card-header">
@@ -639,6 +866,12 @@ function _renderCompareSummary(title, meta, jobId, resultLike, preferredVariant)
             </div>
             <img class="compare-heatmap" src="${_resultHeatmapUrl(jobId, resultLike, preferredVariant)}" alt="${title} heatmap">
             <div class="compare-tiles">${_renderCompareTiles(resultLike.top_tiles || [])}</div>
+            ${detailHtml ? `
+                <details class="compare-detail-panel">
+                    <summary>Calculation and medical audit details</summary>
+                    <div class="compare-detail-body">${detailHtml}</div>
+                </details>
+            ` : ''}
         </div>
     `;
 }

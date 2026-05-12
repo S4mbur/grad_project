@@ -148,6 +148,10 @@
                         </div>
                     </div>
                     <div class="safety-flags" id="safety-flags"></div>
+                    <details class="calc-details" id="safety-details-block" style="display:none;">
+                        <summary>How this safety result was calculated</summary>
+                        <div class="calc-detail-content" id="safety-details"></div>
+                    </details>
                 </div>
 
                 <!-- Probability Bars (4 classes) -->
@@ -181,11 +185,19 @@
                         <span class="prob-value" id="prob-val-melanoma">0%</span>
                     </div>
                 </div>
+                <details class="calc-details" id="prediction-details-block" style="display:none;">
+                    <summary>How this prediction was calculated</summary>
+                    <div class="calc-detail-content" id="prediction-details"></div>
+                </details>
 
                 <!-- Ensemble Details (shown only for ensemble) -->
                 <div class="ensemble-details" id="ensemble-details" style="display:none;">
                     <div class="section-title" style="margin-top:6px;"><span class="icon">🔀</span> Ensemble Breakdown</div>
                     <div id="ensemble-breakdown"></div>
+                    <details class="calc-details" id="ensemble-details-block" style="display:none;">
+                        <summary>How this ensemble decision was calculated</summary>
+                        <div class="calc-detail-content" id="ensemble-calculation-details"></div>
+                    </details>
                 </div>
 
                 <!-- Slide Info -->
@@ -199,6 +211,10 @@
                         <div class="stat-label">Analysis Time</div>
                     </div>
                 </div>
+                <details class="calc-details" id="pipeline-details-block" style="display:none;">
+                    <summary>Pipeline audit trail</summary>
+                    <div class="calc-detail-content" id="pipeline-details"></div>
+                </details>
 
                 <!-- Heatmap Toggle -->
                 <div class="toggle-group" id="heatmap-toggle-group">
@@ -220,10 +236,18 @@
                 <div class="top-tiles-grid" id="top-tiles-grid">
                     <!-- Filled dynamically -->
                 </div>
+                <details class="calc-details" id="attention-details-block" style="display:none;">
+                    <summary>How attention tiles and heatmaps were calculated</summary>
+                    <div class="calc-detail-content" id="attention-details"></div>
+                </details>
 
                 <div class="retrieval-panel" id="retrieval-panel" style="display:none;">
                     <div class="section-title" style="margin-top: 10px;"><span class="icon">R</span> Similar Cases</div>
                     <div class="retrieval-summary" id="retrieval-summary">No retrieval results yet.</div>
+                    <details class="calc-details" id="retrieval-details-block" style="display:none;">
+                        <summary>How retrieval similarity and cost were calculated</summary>
+                        <div class="calc-detail-content" id="retrieval-details"></div>
+                    </details>
                     <div class="retrieval-grid" id="retrieval-grid"></div>
 
                     <div class="section-title retrieval-subtitle" id="hard-retrieval-title" style="display:none;">Hard Melanoma Matches</div>

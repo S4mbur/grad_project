@@ -1,27 +1,51 @@
-# Python
+# Python bytecode / caches
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Python packaging / virtual environments
 *.egg-info/
 .eggs/
 *.egg
-
-# Virtual environments
+build/
+dist/
+pip-wheel-metadata/
 venv/
 env/
 .venv/
 
-# IDE
+# Local environment / secrets
+.env
+.env.*
+!.env.example
+*hf_login.py
+hf_token*
+wandb/
+
+# IDE / OS
 .idea/
 .vscode/
 *.swp
 *.swo
+.DS_Store
+Thumbs.db
+desktop.ini
 
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb
+
+# Windows alternate data streams / download markers
+*Zone.Identifier
+*:Zone.Identifier
 
 # LaTeX auxiliary files
 *.aux
@@ -30,17 +54,16 @@ env/
 *.log
 *.out
 *.toc
+*.lof
+*.lot
 *.fls
 *.fdb_latexmk
 *.synctex.gz
 *.nav
 *.snm
 *.vrb
-# Windows Zone.Identifier files
-*Zone.Identifier
-*:Zone.Identifier
 
-# Large data files - not for GitHub
+# Large data files and generated datasets
 data/tiles/
 data/tiles_4class/
 data/tiles_multiclass/
@@ -53,15 +76,11 @@ data/gradcam_demo/
 data/debug/
 data/reports/
 data/downloads/
-
-# MIL pipeline outputs
 data/mil_demo/
 data/mil_results/
 data/mil_slide_manifest.csv
 
-results/
-
-# Temporary manifest files (keep only essential ones)
+# Temporary/generated manifests
 data/manifests/*predictions*.csv
 data/manifests/*results*.csv
 data/manifests/*scores*.csv
@@ -69,38 +88,52 @@ data/manifests/*hard*.csv
 data/manifests/grid_*.csv
 data/manifests/fp_*.csv
 data/manifests/slide_manifest_batch*.csv
-data/debug/
-*.svs
-*.tif
-*.tiff
-*.ndpi
 
-# Model checkpoints and training logs (large files)
+# Model checkpoints, feature banks, embeddings, and ML artifacts
 logs/checkpoints/
 logs/runs/
 logs/demo_training/
 logs/*.pt
 *.pt
+*.pth
+*.ckpt
+*.onnx
+*.npz
+*.npy
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.joblib
 
-# Temporary/working files
+# Whole-slide images and tiled pathology image data
+*.svs
+*.tif
+*.tiff
+*.ndpi
+*.mrxs
+*.scn
+*.bif
+*.vms
+*.vmu
+
+# Archives / downloaded packages
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+
+# Training/runtime logs and scratch files
 training.log
 tiles_preview.png
 
-# Internal documentation (not for public repo)
-CONTINUE_FROM_HERE.md
-REPORT_WRITING_GUIDE.md
-POST_TRAINING_GUIDE.md
-PROJECT_STATUS.md
-PROJECT_CONTEXT.md
-TECHNICAL_DEEP_DIVE_PART1.md
-TECHNICAL_DEEP_DIVE_PART2.md
-TECHNICAL_DEEP_DIVE_PART3.md
-RESULTS_COMPARISON.md
-FINAL_REPORT.md
-reports/MERMAID_DIAGRAMS.md
-reports/PIPELINE_COMPLETE_REPORT.md
+# Experiment outputs
+results/
 
-# Report / documentation packages (keep architecture code, drop report assets)
+# Report / documentation packages
+# Keep source architecture code in Git, but do not push generated report packs.
 docs/
 reports/
 final_report/
@@ -110,20 +143,15 @@ final_report/
 *.md
 !README.md
 
-# GradCAM files (not used in final report)
-reports/figures/gradcam/
-reports/figures/gradcam_*.png
-
-*.sln
-
-*.pt
-
-# App runtime/upload data (not source code)
+# App runtime/upload data
 app/uploads/
 app/results/
 app/dzi_tiles/
 
-# .NET build outputs
+# .NET build outputs and local solution artifacts
+*.sln
+*.user
+*.suo
 app_desktop/bin/
 app_desktop/obj/
 app_dotnet/bin/
@@ -131,4 +159,20 @@ app_dotnet/obj/
 app_dotnet/uploads/
 app_dotnet/results/
 
-*hf_login.py
+# Accidental empty shell artifacts observed during local experimentation
+/R^C
+/bag
+/broad
+/büyük
+/candidate
+/embedding
+/feature
+/küçük
+/larger
+/logits
+/morphology-aware
+/orta
+/slide-level
+/small
+/structured
+/tiles
