@@ -147,6 +147,7 @@ final_report/
 app/uploads/
 app/results/
 app/dzi_tiles/
+app/continual_retrieval/
 
 # .NET build outputs and local solution artifacts
 *.sln

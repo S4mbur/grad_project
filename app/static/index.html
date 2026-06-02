@@ -22,8 +22,11 @@
             </div>
         </div>
         <div class="header-actions">
+            <button class="btn btn-primary btn-sm" id="btn-pdf-report" onclick="downloadPdfReport()" title="Download clinician-style PDF report" style="display:none;">
+                PDF Report
+            </button>
             <button class="btn btn-ghost btn-sm" id="btn-export" onclick="exportResults()" title="Export current results" style="display:none;">
-                📥 Export
+                JSON Export
             </button>
         </div>
     </header>
@@ -252,6 +255,9 @@
 
                     <div class="section-title retrieval-subtitle" id="hard-retrieval-title" style="display:none;">Hard Melanoma Matches</div>
                     <div class="retrieval-grid compact" id="hard-retrieval-grid"></div>
+
+                    <div class="section-title retrieval-subtitle" id="continual-retrieval-title" style="display:none;">Pending Continual Memory</div>
+                    <div class="retrieval-grid compact" id="continual-retrieval-grid"></div>
                 </div>
             </div>
 

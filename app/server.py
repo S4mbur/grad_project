@@ -45,6 +45,10 @@ PHASE4_DIR = PROJECT_DIR / "results" / "phase4_retrieval"
 PHASE4_RETRIEVAL_PATH = PHASE4_DIR / "retrieval_registry.json"
 PHASE4_EMBEDDINGS_PATH = PHASE4_DIR / "retrieval_embeddings.npz"
 PHASE4_THUMB_DIR = PHASE4_DIR / "thumbnails"
+CONTINUAL_RETRIEVAL_DIR = APP_DIR / "continual_retrieval"
+CONTINUAL_RETRIEVAL_INDEX_PATH = CONTINUAL_RETRIEVAL_DIR / "pending_cases.jsonl"
+CONTINUAL_RETRIEVAL_EMBEDDING_DIR = CONTINUAL_RETRIEVAL_DIR / "embeddings"
+CONTINUAL_RETRIEVAL_THUMB_DIR = CONTINUAL_RETRIEVAL_DIR / "thumbnails"
 PHASE0_DIR = PROJECT_DIR / "results" / "phase0_registry"
 PHASE0_THRESHOLD_PATH = PHASE0_DIR / "threshold_registry.json"
 PHASE0_EXPERIMENT_PATH = PHASE0_DIR / "experiment_registry.json"
@@ -58,9 +62,13 @@ PHASE1_BANK_DIR.mkdir(parents=True, exist_ok=True)
 PHASE2_DIR.mkdir(parents=True, exist_ok=True)
 PHASE4_DIR.mkdir(parents=True, exist_ok=True)
 PHASE4_THUMB_DIR.mkdir(parents=True, exist_ok=True)
+CONTINUAL_RETRIEVAL_DIR.mkdir(parents=True, exist_ok=True)
+CONTINUAL_RETRIEVAL_EMBEDDING_DIR.mkdir(parents=True, exist_ok=True)
+CONTINUAL_RETRIEVAL_THUMB_DIR.mkdir(parents=True, exist_ok=True)
 PHASE0_DIR.mkdir(parents=True, exist_ok=True)
 
 phase1_case_lock = threading.Lock()
+continual_retrieval_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -95,6 +103,17 @@ class AppConfig:
 
     # Cost-aware retrieval
     RETRIEVAL_ACTIVE_METHOD = "trlq_quotient_v2"
+    CONTINUAL_RETRIEVAL_ENABLED = True
+    CONTINUAL_RETRIEVAL_TOP_K = 3
+    CONTINUAL_RETRIEVAL_MAX_CASES = 500
+
+    # Cost-aware gated ensemble. The tile budget intentionally stays fixed;
+    # the saving comes from conditionally skipping extra encoders.
+    GATED_ENSEMBLE_ENABLED = True
+    GATED_ENSEMBLE_CONFIDENCE_THRESHOLD = 0.70
+    GATED_ENSEMBLE_MARGIN_THRESHOLD = 0.20
+    GATED_ENSEMBLE_MELANOMA_PROB_THRESHOLD = 0.20
+    FEATURE_COST_BASELINE_MODELS = 3
 
     # DZI (on-demand)
     DZI_TILE_SIZE = 254
@@ -316,6 +335,22 @@ MODEL_REGISTRY = {
 
 # Ensemble presets from exhaustive search (MelFN=0 validated!)
 ENSEMBLE_PRESETS = {
+    "gated_app_order_cheap_conf70_margin20_mel20": {
+        "name": "Gated Ensemble (Cost-Aware UNI -> Phikon -> CONCH)",
+        "display": "Gated Cost-Aware Ensemble (UNI -> Phikon -> CONCH)",
+        "description": "Sequential guarded ensemble selected from the Phase 9 feature-cost proxy profile. It starts with UNI - Cost-Sensitive Strong and only escalates to Phikon/CONCH when confidence < 0.70, margin < 0.20, or non-melanoma prediction still has P(Melanoma) >= 0.20. Proxy result on 318 aligned test slides: Macro F1 96.0%, Melanoma FN=0, average 1.022 encoders per slide.",
+        "models": ["uni_cost_sensitive_strong", "phikon_cost_sensitive_strong", "conch_cost_sensitive_strong"],
+        "f1": 0.9603, "auc": 0.9957, "mel_fn": 0,
+        "gated": True,
+        "gating_policy": {
+            "name": "cheap_conf70_margin20_mel20",
+            "confidence_below": 0.70,
+            "margin_below": 0.20,
+            "mel_prob_at_least_if_not_mel": 0.20,
+            "confirm_predicted_melanoma": False,
+            "source": "results/phase9_feature_cost_profile/gating_policy_results.csv",
+        },
+    },
     "ensemble_2_best": {
         "name": "Ensemble-2 (Best Pathology Pair)",
         "display": "Ensemble 2-Model (UNI + Phikon)",
@@ -355,6 +390,7 @@ ENSEMBLE_PRESETS = {
 
 # Default ensemble
 ENSEMBLE_MODELS = ENSEMBLE_PRESETS["ensemble_3_best"]["models"]
+DEFAULT_MODEL_KEY = "gated_app_order_cheap_conf70_margin20_mel20"
 
 
 # ---------------------------------------------------------------------------
@@ -461,6 +497,163 @@ def _ensure_openslide():
         _openslide = openslide
         logger.info("OpenSlide loaded")
     return _openslide
+
+
+def _is_ensemble_key(model_key):
+    return model_key in ENSEMBLE_PRESETS or str(model_key).startswith("ensemble")
+
+
+def _probability_stats(probabilities):
+    probs = np.asarray(probabilities, dtype=np.float32)
+    order = np.argsort(probs)[::-1]
+    top1_idx = int(order[0])
+    top2_idx = int(order[1]) if len(order) > 1 else top1_idx
+    confidence = float(probs[top1_idx])
+    margin = float(probs[top1_idx] - probs[top2_idx])
+    melanoma_prob = float(probs[CLASS_KEYS.index("melanoma")])
+    return {
+        "prediction_id": top1_idx,
+        "prediction": CLASS_NAMES[top1_idx],
+        "confidence": confidence,
+        "margin": margin,
+        "melanoma_probability": melanoma_prob,
+        "top2_prediction_id": top2_idx,
+        "top2_prediction": CLASS_NAMES[top2_idx],
+    }
+
+
+def _gated_escalation_decision(probabilities, policy, is_last_model=False):
+    stats = _probability_stats(probabilities)
+    reasons = []
+    if is_last_model:
+        return False, ["candidate_model_limit_reached"], stats
+
+    confidence_below = float(policy.get("confidence_below", cfg.GATED_ENSEMBLE_CONFIDENCE_THRESHOLD))
+    margin_below = float(policy.get("margin_below", cfg.GATED_ENSEMBLE_MARGIN_THRESHOLD))
+    mel_prob_threshold = float(policy.get("mel_prob_at_least_if_not_mel", cfg.GATED_ENSEMBLE_MELANOMA_PROB_THRESHOLD))
+    confirm_predicted_melanoma = bool(policy.get("confirm_predicted_melanoma", False))
+
+    if stats["confidence"] < confidence_below:
+        reasons.append(f"confidence {stats['confidence']:.4f} < {confidence_below:.2f}")
+    if stats["margin"] < margin_below:
+        reasons.append(f"margin {stats['margin']:.4f} < {margin_below:.2f}")
+    if stats["prediction"] != "Melanoma" and stats["melanoma_probability"] >= mel_prob_threshold:
+        reasons.append(f"non-melanoma prediction with P(Melanoma) {stats['melanoma_probability']:.4f} >= {mel_prob_threshold:.2f}")
+    if confirm_predicted_melanoma and stats["prediction"] == "Melanoma":
+        reasons.append("predicted melanoma requires confirmatory component")
+
+    if reasons:
+        return True, reasons, stats
+    return False, ["all_guard_conditions_passed"], stats
+
+
+def _matching_ensemble_key_for_models(model_keys):
+    model_keys = list(model_keys or [])
+    for preset_key, preset in ENSEMBLE_PRESETS.items():
+        if list(preset.get("models") or []) == model_keys and not preset.get("gated"):
+            return preset_key
+    if len(model_keys) == 1:
+        return model_keys[0]
+    return None
+
+
+def _resolve_retrieval_target(model_key, invoked_model_keys, bag_embeddings):
+    invoked_model_keys = list(invoked_model_keys or [])
+    bag_embeddings = list(bag_embeddings or [])
+    if not invoked_model_keys or not bag_embeddings:
+        return {
+            "retrieval_model_key": model_key,
+            "bag_embedding": None,
+            "ensemble_model_keys": None,
+            "ensemble_bag_embeddings": None,
+            "reason": "No invoked model embeddings were available; using requested model key.",
+        }
+
+    matched_key = _matching_ensemble_key_for_models(invoked_model_keys)
+    if matched_key and len(invoked_model_keys) == 1:
+        return {
+            "retrieval_model_key": matched_key,
+            "bag_embedding": bag_embeddings[0],
+            "ensemble_model_keys": None,
+            "ensemble_bag_embeddings": None,
+            "reason": "Gated ensemble stopped after one encoder, so retrieval uses that single-model bank.",
+        }
+    if matched_key:
+        return {
+            "retrieval_model_key": matched_key,
+            "bag_embedding": None,
+            "ensemble_model_keys": invoked_model_keys,
+            "ensemble_bag_embeddings": bag_embeddings,
+            "reason": "Invoked gated components match a precomputed ensemble retrieval bank.",
+        }
+
+    return {
+        "retrieval_model_key": invoked_model_keys[0],
+        "bag_embedding": bag_embeddings[0],
+        "ensemble_model_keys": None,
+        "ensemble_bag_embeddings": None,
+        "reason": "No exact ensemble bank exists for the invoked component subset; falling back to the first invoked model bank.",
+    }
+
+
+def _build_feature_cost_profile(
+    n_tiles,
+    candidate_model_keys,
+    invoked_model_keys,
+    gating_policy=None,
+    gating_decisions=None,
+    model_timings=None,
+    retrieval_target=None,
+):
+    candidate_model_keys = list(candidate_model_keys or [])
+    invoked_model_keys = list(invoked_model_keys or [])
+    n_tiles = int(n_tiles or 0)
+    actual_tile_encoder_calls = n_tiles * len(invoked_model_keys)
+    same_slide_full_calls = n_tiles * max(len(candidate_model_keys), 1)
+    fixed_baseline_calls = cfg.MAX_TILES_FOR_ANALYSIS * cfg.FEATURE_COST_BASELINE_MODELS
+    saved_same_slide = max(same_slide_full_calls - actual_tile_encoder_calls, 0)
+
+    return {
+        "title": "Feature extraction cost profile",
+        "summary": "Cost-aware ensemble gating keeps the tile budget fixed but avoids running extra encoders when the current averaged prediction is already confident and melanoma-safe.",
+        "mode": "gated_ensemble" if gating_policy else "standard",
+        "tile_budget": cfg.MAX_TILES_FOR_ANALYSIS,
+        "tiles_used": n_tiles,
+        "candidate_models": candidate_model_keys,
+        "candidate_model_names": [MODEL_REGISTRY.get(m, {}).get("display", m) for m in candidate_model_keys],
+        "models_run": invoked_model_keys,
+        "model_names_run": [MODEL_REGISTRY.get(m, {}).get("display", m) for m in invoked_model_keys],
+        "models_skipped": [m for m in candidate_model_keys if m not in invoked_model_keys],
+        "num_models_run": len(invoked_model_keys),
+        "num_candidate_models": len(candidate_model_keys),
+        "actual_tile_encoder_calls": actual_tile_encoder_calls,
+        "same_slide_full_candidate_tile_encoder_calls": same_slide_full_calls,
+        "fixed_3model_200tile_baseline_calls": fixed_baseline_calls,
+        "saved_tile_encoder_calls_vs_same_slide_full": saved_same_slide,
+        "cost_ratio_vs_same_slide_full_candidate_ensemble": round(actual_tile_encoder_calls / max(float(same_slide_full_calls), 1.0), 4),
+        "cost_ratio_vs_3model_200tile_baseline": round(actual_tile_encoder_calls / max(float(fixed_baseline_calls), 1.0), 4),
+        "estimated_reduction_percent_vs_same_slide_full": round(100.0 * saved_same_slide / max(float(same_slide_full_calls), 1.0), 2),
+        "gating_policy": gating_policy or {},
+        "gating_decisions": gating_decisions or [],
+        "model_timings": model_timings or [],
+        "retrieval_target": retrieval_target or {},
+        "formulae": [
+            "actual_tile_encoder_calls = tiles_used * number_of_models_run",
+            "same_slide_full_candidate_calls = tiles_used * number_of_candidate_models",
+            "fixed_3model_200tile_baseline_calls = 200 * 3",
+            "cost_ratio_vs_same_slide_full = actual_tile_encoder_calls / same_slide_full_candidate_calls",
+            "cost_ratio_vs_3model_200tile = actual_tile_encoder_calls / fixed_3model_200tile_baseline_calls",
+            "escalate if confidence < 0.70 OR margin < 0.20 OR non-melanoma prediction has P(Melanoma) >= 0.20",
+        ],
+        "replication_steps": [
+            "Extract the same 200-tile bag once from the WSI.",
+            "Run UNI first and compute class probabilities.",
+            "Average probabilities over all invoked models after each step.",
+            "Apply the guard rule to decide whether another encoder is worth the cost.",
+            "Stop early when all guard conditions pass; otherwise continue to Phikon and then CONCH.",
+            "Report the actual number of tile-encoder calls against the hypothetical full three-model baseline.",
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -604,7 +797,8 @@ def _get_mil_model(model_key):
 def run_analysis(job_id: str, slide_path: str, model_key: str):
     """Run full analysis pipeline in background thread."""
     try:
-        is_ensemble = model_key.startswith("ensemble")
+        is_ensemble = _is_ensemble_key(model_key)
+        ensemble_cfg = None
         if is_ensemble:
             preset_key = model_key if model_key in ENSEMBLE_PRESETS else "ensemble_3"
             ensemble_cfg = ENSEMBLE_PRESETS[preset_key]
@@ -642,6 +836,7 @@ def run_analysis(job_id: str, slide_path: str, model_key: str):
         _update_job(job_id, progress=30,
                     message=f"Extracted {len(tiles)} tiles. Loading {model_display}...")
 
+        feature_cost_profile = None
         if is_ensemble:
             # Run ensemble: extract features & run MIL for each model
             all_probs = []
@@ -652,21 +847,32 @@ def run_analysis(job_id: str, slide_path: str, model_key: str):
             all_calibrations = []
             all_contrastive_views = []
             model_results = []
+            invoked_model_keys = []
+            model_timings = []
+            gating_decisions = []
+            is_gated_ensemble = bool(ensemble_cfg.get("gated")) and bool(cfg.GATED_ENSEMBLE_ENABLED)
+            gating_policy = dict(ensemble_cfg.get("gating_policy") or {}) if is_gated_ensemble else None
+            ensemble_loop_started = time.perf_counter()
 
             for i, mkey in enumerate(ENSEMBLE_MODELS_RUN):
                 pct = 30 + int(50 * i / len(ENSEMBLE_MODELS_RUN))
                 mname = MODEL_REGISTRY[mkey]["display"]
                 _update_job(job_id, progress=pct,
-                            message=f"Ensemble: running {mname} ({i+1}/{len(ENSEMBLE_MODELS_RUN)})...")
+                            message=f"{'Gated ensemble' if is_gated_ensemble else 'Ensemble'}: running {mname} ({i+1}/{len(ENSEMBLE_MODELS_RUN)})...")
 
+                feature_started = time.perf_counter()
                 features = _extract_features(tiles, mkey)
+                feature_seconds = time.perf_counter() - feature_started
+                mil_started = time.perf_counter()
                 pred, probs, attn, bag_embedding, raw_probs, contrastive_views = _run_mil_inference(features, mkey)
+                mil_seconds = time.perf_counter() - mil_started
                 all_probs.append(probs)
                 all_raw_probs.append(raw_probs)
                 all_attns.append(attn)
                 all_preds.append(pred)
                 all_bag_embeddings.append(bag_embedding)
                 all_contrastive_views.append(contrastive_views)
+                invoked_model_keys.append(mkey)
                 calibration_meta = _get_calibration_entry(mkey) or {}
                 all_calibrations.append({
                     "model_key": mkey,
@@ -679,10 +885,50 @@ def run_analysis(job_id: str, slide_path: str, model_key: str):
                     "mce_after": calibration_meta.get("mce_after"),
                 })
                 model_results.append({
+                    "model_key": mkey,
                     "model": mname,
                     "prediction": CLASS_NAMES[pred],
                     "probabilities": {CLASS_NAMES[c]: round(float(probs[c]), 4) for c in range(N_CLASSES)},
+                    "feature_extraction_seconds": round(float(feature_seconds), 4),
+                    "mil_inference_seconds": round(float(mil_seconds), 4),
                 })
+                model_timings.append({
+                    "model_key": mkey,
+                    "model_display": mname,
+                    "tiles_encoded": len(tiles),
+                    "feature_extraction_seconds": round(float(feature_seconds), 4),
+                    "mil_inference_seconds": round(float(mil_seconds), 4),
+                    "total_seconds": round(float(feature_seconds + mil_seconds), 4),
+                })
+
+                if is_gated_ensemble:
+                    avg_so_far = np.mean(all_probs, axis=0)
+                    is_last = i == len(ENSEMBLE_MODELS_RUN) - 1
+                    escalate, reasons, stats = _gated_escalation_decision(
+                        avg_so_far,
+                        gating_policy,
+                        is_last_model=is_last,
+                    )
+                    gating_decisions.append({
+                        "step": len(invoked_model_keys),
+                        "last_model_key": mkey,
+                        "last_model_display": mname,
+                        "averaged_prediction": stats["prediction"],
+                        "confidence": round(float(stats["confidence"]), 4),
+                        "margin": round(float(stats["margin"]), 4),
+                        "melanoma_probability": round(float(stats["melanoma_probability"]), 4),
+                        "escalated": bool(escalate),
+                        "reasons": reasons,
+                    })
+                    if not escalate:
+                        logger.info(
+                            "Gated ensemble stopped after %s/%s models for %s: %s",
+                            len(invoked_model_keys),
+                            len(ENSEMBLE_MODELS_RUN),
+                            job_id,
+                            "; ".join(reasons),
+                        )
+                        break
 
             # Average probabilities
             avg_probs = np.mean(all_probs, axis=0)
@@ -696,29 +942,70 @@ def run_analysis(job_id: str, slide_path: str, model_key: str):
             safety = _merge_phase2_ensemble_safety(
                 safety,
                 probabilities,
-                ENSEMBLE_MODELS_RUN,
+                invoked_model_keys,
                 all_bag_embeddings,
                 all_calibrations,
                 raw_probabilities=avg_raw_probs,
             )
             safety = _annotate_threshold_policy(safety, model_key)
-            retrieval = _retrieve_similar_cases(
-                model_key,
-                ensemble_model_keys=ENSEMBLE_MODELS_RUN,
-                ensemble_bag_embeddings=all_bag_embeddings,
-                probabilities=probabilities,
-                safety=safety,
-                query_slide_id=Path(slide_path).stem,
+            if is_gated_ensemble:
+                retrieval_target = _resolve_retrieval_target(
+                    model_key,
+                    invoked_model_keys,
+                    all_bag_embeddings,
+                )
+                retrieval = _retrieve_similar_cases(
+                    retrieval_target["retrieval_model_key"],
+                    bag_embedding=retrieval_target["bag_embedding"],
+                    ensemble_model_keys=retrieval_target["ensemble_model_keys"],
+                    ensemble_bag_embeddings=retrieval_target["ensemble_bag_embeddings"],
+                    probabilities=probabilities,
+                    safety=safety,
+                    query_slide_id=Path(slide_path).stem,
+                )
+            else:
+                retrieval_target = {
+                    "retrieval_model_key": model_key,
+                    "bag_embedding": None,
+                    "ensemble_model_keys": ENSEMBLE_MODELS_RUN,
+                    "ensemble_bag_embeddings": all_bag_embeddings,
+                    "reason": "Standard full ensemble uses the selected ensemble retrieval bank.",
+                }
+                retrieval = _retrieve_similar_cases(
+                    model_key,
+                    ensemble_model_keys=ENSEMBLE_MODELS_RUN,
+                    ensemble_bag_embeddings=all_bag_embeddings,
+                    probabilities=probabilities,
+                    safety=safety,
+                    query_slide_id=Path(slide_path).stem,
+                )
+            retrieval_target_summary = {
+                "retrieval_model_key": retrieval_target.get("retrieval_model_key"),
+                "reason": retrieval_target.get("reason"),
+            }
+            feature_cost_profile = _build_feature_cost_profile(
+                len(tiles),
+                ENSEMBLE_MODELS_RUN,
+                invoked_model_keys,
+                gating_policy=gating_policy,
+                gating_decisions=gating_decisions,
+                model_timings=model_timings,
+                retrieval_target=retrieval_target_summary,
             )
+            feature_cost_profile["ensemble_loop_seconds"] = round(float(time.perf_counter() - ensemble_loop_started), 4)
 
         else:
             # Single model
             _update_job(job_id, progress=40,
                         message=f"Extracting features with {model_display}...")
+            feature_started = time.perf_counter()
             features = _extract_features(tiles, model_key)
+            feature_seconds = time.perf_counter() - feature_started
 
             _update_job(job_id, progress=65, message="Running MIL inference...")
+            mil_started = time.perf_counter()
             prediction, probabilities, attention_weights, bag_embedding, raw_probabilities, contrastive_views = _run_mil_inference(features, model_key)
+            mil_seconds = time.perf_counter() - mil_started
             model_results = None
             attention_views = {"attention": _normalize_attention_weights(attention_weights)}
             attention_views.update(contrastive_views)
@@ -732,12 +1019,36 @@ def run_analysis(job_id: str, slide_path: str, model_key: str):
                 raw_probabilities=raw_probabilities,
             )
             safety = _annotate_threshold_policy(safety, model_key)
+            retrieval_target = {
+                "retrieval_model_key": model_key,
+                "bag_embedding": bag_embedding,
+                "ensemble_model_keys": None,
+                "ensemble_bag_embeddings": None,
+                "reason": "Single-model analysis uses the selected model retrieval bank.",
+            }
             retrieval = _retrieve_similar_cases(
-                model_key,
-                bag_embedding=bag_embedding,
+                retrieval_target["retrieval_model_key"],
+                bag_embedding=retrieval_target["bag_embedding"],
                 probabilities=probabilities,
                 safety=safety,
                 query_slide_id=Path(slide_path).stem,
+            )
+            feature_cost_profile = _build_feature_cost_profile(
+                len(tiles),
+                [model_key],
+                [model_key],
+                model_timings=[{
+                    "model_key": model_key,
+                    "model_display": model_display,
+                    "tiles_encoded": len(tiles),
+                    "feature_extraction_seconds": round(float(feature_seconds), 4),
+                    "mil_inference_seconds": round(float(mil_seconds), 4),
+                    "total_seconds": round(float(feature_seconds + mil_seconds), 4),
+                }],
+                retrieval_target={
+                    "retrieval_model_key": retrieval_target["retrieval_model_key"],
+                    "reason": retrieval_target["reason"],
+                },
             )
 
         _update_job(job_id, progress=80, message="Generating heatmap...")
@@ -794,6 +1105,7 @@ def run_analysis(job_id: str, slide_path: str, model_key: str):
             "default_heatmap_view": "consensus" if is_ensemble else "attention",
             "model_used": model_display,
             "model_key": model_key,
+            "feature_cost_profile": feature_cost_profile,
             "timestamp": datetime.now().isoformat(),
         }
         # For ensemble, include individual model predictions
@@ -804,6 +1116,7 @@ def run_analysis(job_id: str, slide_path: str, model_key: str):
         result["artifacts"] = _build_result_artifacts(job_id, result)
 
         _record_phase1_inference_case(job_id, slide_path, model_key, model_display, slide_info, result)
+        _record_continual_retrieval_case(job_id, slide_path, model_key, model_display, slide_info, result, retrieval_target)
 
         _update_job(job_id, status="completed", progress=100,
                     message="Analysis complete!", result=result)
@@ -2235,6 +2548,203 @@ def _format_retrieval_case(case_meta, similarity, method="cosine", component_sco
     }
 
 
+def _read_continual_retrieval_records_unlocked():
+    if not CONTINUAL_RETRIEVAL_INDEX_PATH.exists():
+        return []
+    records = []
+    with open(CONTINUAL_RETRIEVAL_INDEX_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict):
+                records.append(record)
+    return records
+
+
+def _write_continual_retrieval_records_unlocked(records):
+    CONTINUAL_RETRIEVAL_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_path = CONTINUAL_RETRIEVAL_INDEX_PATH.with_suffix(".jsonl.tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    tmp_path.replace(CONTINUAL_RETRIEVAL_INDEX_PATH)
+
+
+def _probabilities_from_result_dict(result):
+    probs = result.get("probabilities") or {}
+    out = {}
+    for name in CLASS_NAMES.values():
+        try:
+            out[name] = float(probs.get(name, 0.0))
+        except (TypeError, ValueError):
+            out[name] = 0.0
+    total = sum(max(v, 0.0) for v in out.values())
+    if total <= 0:
+        return {name: 1.0 / N_CLASSES for name in CLASS_NAMES.values()}
+    return {name: max(v, 0.0) / total for name, v in out.items()}
+
+
+def _signal_from_continual_record(record):
+    probs = record.get("probabilities") or {}
+    normalized = {}
+    for name in CLASS_NAMES.values():
+        try:
+            normalized[name] = float(probs.get(name, 0.0))
+        except (TypeError, ValueError):
+            normalized[name] = 0.0
+    total = sum(max(v, 0.0) for v in normalized.values())
+    if total <= 0:
+        normalized = _prob_dict_from_row(None, fallback_label=record.get("predicted_label"))
+    else:
+        normalized = {name: max(value, 0.0) / total for name, value in normalized.items()}
+    return _signal_from_prob_dict(
+        normalized,
+        pred_label=record.get("predicted_label"),
+        hard_case_candidate=bool(record.get("hard_case_candidate")),
+    )
+
+
+def _load_continual_retrieval_memory(model_key, embedding_dim, exclude_slide_id=None, exclude_job_id=None):
+    if not cfg.CONTINUAL_RETRIEVAL_ENABLED:
+        return [], np.zeros((0, int(embedding_dim)), dtype=np.float32)
+
+    with continual_retrieval_lock:
+        records = _read_continual_retrieval_records_unlocked()
+
+    selected = []
+    embeddings = []
+    for record in reversed(records):
+        if len(selected) >= cfg.CONTINUAL_RETRIEVAL_MAX_CASES:
+            break
+        if record.get("retrieval_model_key") != model_key:
+            continue
+        if exclude_job_id and record.get("job_id") == exclude_job_id:
+            continue
+        if exclude_slide_id and record.get("slide_id") == exclude_slide_id:
+            continue
+        if int(record.get("embedding_dim") or -1) != int(embedding_dim):
+            continue
+
+        emb_path = Path(record.get("embedding_path") or "")
+        if not emb_path.exists():
+            continue
+        try:
+            emb = _normalize_embedding(np.load(str(emb_path), allow_pickle=False))
+        except Exception:
+            logger.warning("Skipping unreadable continual retrieval embedding: %s", emb_path)
+            continue
+        if emb.shape[0] != int(embedding_dim):
+            continue
+        selected.append(record)
+        embeddings.append(emb.astype(np.float32))
+
+    if not embeddings:
+        return [], np.zeros((0, int(embedding_dim)), dtype=np.float32)
+    return selected, np.stack(embeddings, axis=0).astype(np.float32)
+
+
+def _format_continual_retrieval_case(record, similarity, method, component_scores=None, rank_score=None):
+    similarity_value = round(float(similarity), 4)
+    label = record.get("predicted_label") or record.get("display_prediction") or "Pending review"
+    job_id = record.get("job_id")
+    thumb_path = Path(record.get("thumbnail_path") or (CONTINUAL_RETRIEVAL_THUMB_DIR / f"{job_id}.jpg"))
+    thumbnail_url = f"/api/retrieval/continual/thumbnails/{job_id}.jpg" if job_id and thumb_path.exists() else None
+    return {
+        "case_id": job_id,
+        "slide_id": record.get("slide_id") or job_id,
+        "filename": record.get("filename"),
+        "true_label": label,
+        "predicted_label": label,
+        "label_source": "model_prediction_unverified",
+        "source": "continual pending memory",
+        "verification_status": "unverified",
+        "similarity": similarity_value,
+        "thumbnail_url": thumbnail_url,
+        "is_hard_melanoma": bool(record.get("hard_case_candidate")),
+        "is_continual_memory": True,
+        "compare_available": False,
+        "detail": {
+            "metric": method,
+            "score": similarity_value,
+            "rank_score": None if rank_score is None else round(float(rank_score), 4),
+            "component_scores": component_scores or {},
+            "verification_status": "unverified pending memory",
+            "label_source": "The displayed class is the model prediction from a previous analysis, not a pathology-confirmed label.",
+            "formula": "The same active TRLQ/AAGS component score is computed on the stored MIL bag embedding, but the case is kept outside the verified reference bank.",
+            "computed_from": "Stored slide-level MIL bag embedding from a previous local analysis.",
+            "interpretation": "Use this as short-term case memory for audit and demo continuity, not as a validated diagnostic reference.",
+            "medical_use": "A pathologist or project reviewer must verify the case before it can be promoted into a curated reference bank.",
+        },
+    }
+
+
+def _retrieve_continual_memory_cases(model_key, query, query_signal, method, exclude_slide_id=None, top_k=None):
+    top_k = int(top_k or cfg.CONTINUAL_RETRIEVAL_TOP_K)
+    records, memory_embeddings = _load_continual_retrieval_memory(
+        model_key,
+        int(query.shape[0]),
+        exclude_slide_id=exclude_slide_id,
+    )
+    summary = {
+        "enabled": bool(cfg.CONTINUAL_RETRIEVAL_ENABLED),
+        "verification_status": "unverified",
+        "eligible_cases": int(len(records)),
+        "returned_cases": 0,
+        "policy": "New analyses are stored in a pending local memory bank and are not promoted to verified retrieval references without review.",
+    }
+    if not len(records):
+        return [], summary, {
+            "memory_bank_size": 0,
+            "equivalent_full_vector_comparisons": 0,
+            "execution_note": "No eligible pending memory cases were available for this retrieval bank.",
+        }
+
+    signals = [_signal_from_continual_record(record) for record in records]
+    labels = [signal["pred_label"] for signal in signals]
+    signatures = np.stack([_clinical_signature_from_signal(signal) for signal in signals], axis=0)
+    axes = np.stack([_pathology_axis_from_signal(signal) for signal in signals], axis=0)
+    bank_signals = {
+        "labels": labels,
+        "signals": signals,
+        "signatures": signatures,
+        "axes": axes,
+        "risk_ranks": np.asarray([_signal_risk_rank(signal) for signal in signals], dtype=np.int64),
+        "quotient": _build_diagnostic_quotient(memory_embeddings, signatures),
+    }
+    candidate_indices = np.arange(len(records), dtype=np.int64)
+    scores, components = _score_specific_candidates(
+        query,
+        memory_embeddings,
+        bank_signals,
+        query_signal,
+        candidate_indices,
+        method,
+    )
+    order = np.argsort(scores)[::-1][:top_k] if len(scores) else []
+    cases = []
+    for local_pos in order:
+        idx = int(local_pos)
+        cases.append(_format_continual_retrieval_case(
+            records[idx],
+            _display_similarity_from_active_score(scores[idx], method),
+            method=method,
+            component_scores=_format_component_snapshot(components, idx),
+            rank_score=scores[idx],
+        ))
+
+    summary["returned_cases"] = int(len(cases))
+    return cases, summary, {
+        "memory_bank_size": int(len(records)),
+        "equivalent_full_vector_comparisons": int(len(records)),
+        "execution_note": "The pending memory bank is intentionally small, so eligible unverified cases are scored directly after the curated-bank search.",
+    }
+
+
 def _retrieve_similar_cases(
     model_key,
     bag_embedding=None,
@@ -2407,8 +2917,16 @@ def _retrieve_similar_cases(
             rank_score=hard_scores[int(local_pos)],
         ))
     hard_scan_count = int(len(hard_indices))
-    active_equiv_total = active_equiv + hard_scan_count
-    saved_equiv = max(float(baseline_cost["comparisons"]) - active_equiv_total, 0.0)
+    continual_cases, continual_memory, continual_cost = _retrieve_continual_memory_cases(
+        model_key,
+        query,
+        query_signal,
+        active_method,
+        exclude_slide_id=query_slide_id,
+    )
+    baseline_total_comparisons = int(baseline_cost["comparisons"]) + int(continual_memory.get("eligible_cases", 0))
+    active_equiv_total = active_equiv + hard_scan_count + float(continual_cost.get("equivalent_full_vector_comparisons", 0) or 0)
+    saved_equiv = max(float(baseline_total_comparisons) - active_equiv_total, 0.0)
 
     return {
         "available": True,
@@ -2419,12 +2937,15 @@ def _retrieve_similar_cases(
         "hard_case_count": int(bank.get("hard_case_count", 0)),
         "similar_cases": similar_cases,
         "hard_melanoma_matches": hard_cases,
+        "continual_cases": continual_cases,
+        "continual_memory": continual_memory,
         "details": {
             "title": "Cost-aware pathology retrieval calculation",
-            "summary": "The retrieval panel now uses TRLQ/AAGS-style cost-aware pathology search instead of exhaustive cosine. It routes by cheap clinical/pathology signals, then spends full embedding comparisons only on a short candidate list.",
+            "summary": "The retrieval panel uses TRLQ/AAGS-style cost-aware pathology search instead of exhaustive cosine. It routes curated references by cheap clinical/pathology signals, then optionally adds a small pending memory bank of previous local analyses as unverified case memory.",
             "clinical_context": [
                 "Similar cases are not additional labels. They are visual and statistical evidence that helps a reviewer ask whether the current slide resembles known BCC, SCC, melanoma, benign, or hard melanoma examples.",
                 "The hard-melanoma list is useful when the model predicts another class but the feature space still places the case near difficult melanoma examples.",
+                "Continual-memory cases are shown only as pending, unverified local examples. Their label is the previous model prediction until a reviewer confirms it.",
                 "The risk tier controls search breadth: high-risk or melanoma-borderline queries deliberately search more widely; low-risk queries spend less retrieval cost."
             ],
             "technical_context": [
@@ -2432,7 +2953,8 @@ def _retrieve_similar_cases(
                 "Each bank vector was precomputed from the same feature extractor/MIL family, then L2-normalized before storage.",
                 "A cheap clinical signature p=[P(Normal),P(BCC),P(SCC),P(Melanoma),confidence,margin,P(Melanoma),entropy] and pathology axis vector are used to route candidates before full embedding scoring.",
                 "AAGS combines component similarities by a weighted product. TRLQ maps component similarities to tropical costs with -log and minimizes accumulated evidence penalty.",
-                "The active production path is TRLQ quotient v2; full cosine is retained only as a displayed baseline cost, not as the executed search."
+                "The active production path is TRLQ quotient v2; full cosine is retained only as a displayed baseline cost, not as the executed search.",
+                "The continual bank is separate from the curated Phase 4 reference bank. It stores local query embeddings after analysis and excludes the current slide from subsequent retrieval."
             ],
             "metric": active_method,
             "metric_formula": "TRLQ score(q,x)=exp(-sum_i w_i * -log(s_i(q,x))); AAGS score(q,x)=prod_i s_i(q,x)^w_i",
@@ -2442,19 +2964,29 @@ def _retrieve_similar_cases(
                 "active_runtime_mode": active_method,
                 "risk_tier": active.get("tier"),
                 "bank_size": exhaustive_comparisons,
-                "full_cosine_baseline_comparisons": baseline_cost["comparisons"],
-                "full_cosine_baseline_multiply_adds": baseline_cost["multiply_adds_estimate"],
+                "pending_memory_cases": continual_memory.get("eligible_cases", 0),
+                "effective_search_space": baseline_total_comparisons,
+                "full_cosine_baseline_comparisons": baseline_total_comparisons,
+                "verified_bank_cosine_baseline_comparisons": baseline_cost["comparisons"],
+                "full_cosine_baseline_multiply_adds": int(baseline_total_comparisons * embedding_dim),
                 "active_equivalent_full_vector_comparisons": round(active_equiv_total, 4),
-                "active_embedding_dot_products_executed": int((active_cost.get("embedding_dot_products_executed") or 0) + hard_scan_count),
+                "active_embedding_dot_products_executed": int((active_cost.get("embedding_dot_products_executed") or 0) + hard_scan_count + int(continual_cost.get("memory_bank_size", 0) or 0)),
                 "saved_equivalent_comparisons_vs_cosine": round(saved_equiv, 4),
-                "cost_ratio_vs_full_cosine": round(active_equiv_total / max(float(baseline_cost["comparisons"]), 1.0), 4),
-                "estimated_cost_reduction_percent": round(100.0 * saved_equiv / max(float(baseline_cost["comparisons"]), 1.0), 2),
+                "cost_ratio_vs_full_cosine": round(active_equiv_total / max(float(baseline_total_comparisons), 1.0), 4),
+                "estimated_cost_reduction_percent": round(100.0 * saved_equiv / max(float(baseline_total_comparisons), 1.0), 2),
                 "candidate_count_after_safe_routing": active_cost.get("candidate_count"),
                 "preselect_budget": active_cost.get("preselect_budget"),
                 "rerank_budget": active_cost.get("rerank_budget"),
                 "melanoma_guard_extra_scan": active_cost.get("melanoma_guard_extra_scan"),
                 "hard_melanoma_evidence_scan": hard_scan_count,
+                "continual_memory_equivalent_comparisons": continual_cost.get("equivalent_full_vector_comparisons", 0),
                 "baseline_note": baseline_cost["note"],
+            },
+            "continual_memory": {
+                **continual_memory,
+                "returned_slide_ids": [case.get("slide_id") for case in continual_cases],
+                "cost_equivalent_comparisons": continual_cost.get("equivalent_full_vector_comparisons", 0),
+                "why_separate": "A pending case may be useful for workflow continuity, but it is not included in curated reference-bank statistics until review.",
             },
             "method_comparison": method_summaries,
             "formulae": [
@@ -2466,7 +2998,8 @@ def _retrieve_similar_cases(
                 "MACS = SAFE-R candidate routing + clinical/pathology preselection + embedding rerank on the shortlist",
                 "AAGS = product_i component_i ^ weight_i",
                 "TRLQ = exp(-sum_i weight_i * (-log(component_i)))",
-                "full_cosine_cost = N * D multiply-adds",
+                "continual_memory_score = active_metric(q, stored_pending_embedding); label remains model_prediction_unverified",
+                "full_cosine_cost = (N_verified + N_pending) * D multiply-adds",
                 "active_cost ~= routed_low_dim_cost + preselect_embedding_dots + rerank_component_cost + melanoma_guard_scan",
             ],
             "score_distribution": {
@@ -2482,6 +3015,7 @@ def _retrieve_similar_cases(
                 "Use cheap routing scores to preselect a short list instead of scoring every bank embedding.",
                 "Run TRLQ quotient v2 on the shortlist and return the top similar cases.",
                 "Run a hard-melanoma evidence pass so dangerous analogues remain visible.",
+                "Score eligible pending-memory cases separately and display them with an unverified label.",
             ],
             "replication_steps": [
                 "Run the same encoder and MIL model on the query WSI to obtain bag embedding z.",
@@ -2491,12 +3025,14 @@ def _retrieve_similar_cases(
                 "Compute SAFE-R tier and candidate mask from query probabilities and melanoma safety flags.",
                 "Compute routing scores on low-dimensional signatures.",
                 "Compute full embedding/component scores only for the preselected shortlist.",
-                "Rank by active TRLQ score and map indices back to case metadata."
+                "Rank by active TRLQ score and map indices back to case metadata.",
+                "Load pending local memory embeddings with the same retrieval bank key, exclude the current slide id, and score the small pending set as unverified supplementary memory."
             ],
             "limitations": [
                 "Cost numbers are equivalent full-vector comparisons; low-dimensional routing operations are converted to comparable units for transparency.",
                 "A retrieved case supports explanation and review; it is not a ground-truth diagnosis for the current WSI.",
-                "TRLQ/AAGS are pathology-specific because their components depend on melanoma probability, diagnostic quotient, risk lattice and differential diagnosis structure."
+                "TRLQ/AAGS are pathology-specific because their components depend on melanoma probability, diagnostic quotient, risk lattice and differential diagnosis structure.",
+                "Continual-memory retrieval is for local audit continuity; promotion into the verified bank requires pathologist or dataset-level validation."
             ],
         },
     }
@@ -2530,7 +3066,427 @@ def _build_result_artifacts(job_id, result):
         "heatmap_mask_urls": mask_urls,
         "tile_base_url": f"/api/results/{job_id}/tiles",
         "export_url": f"/api/results/{job_id}/export",
+        "pdf_report_url": f"/api/results/{job_id}/report.pdf",
     }
+
+
+def _build_export_payload(job_id, job):
+    result = job["result"]
+    return {
+        "job_id": job_id,
+        "filename": job.get("filename"),
+        "analysis_date": job.get("created_at"),
+        "model": job.get("model_display"),
+        "model_key": job.get("model_key"),
+        "result": result,
+        "slide_info": job.get("slide_info"),
+        "decision_policy": {
+            "abstain_confidence_threshold": cfg.ABSTAIN_CONFIDENCE_THRESHOLD,
+            "high_uncertainty_threshold": cfg.HIGH_UNCERTAINTY_THRESHOLD,
+            "moderate_uncertainty_threshold": cfg.MODERATE_UNCERTAINTY_THRESHOLD,
+            "low_margin_threshold": cfg.LOW_MARGIN_THRESHOLD,
+            "melanoma_borderline_probability": cfg.MELANOMA_BORDERLINE_PROB,
+            "melanoma_high_risk_probability": cfg.MELANOMA_HIGH_RISK_PROB,
+            "ensemble_disagreement_threshold": cfg.ENSEMBLE_DISAGREEMENT_THRESHOLD,
+            "ood_strong_threshold": cfg.OOD_STRONG_THRESHOLD,
+            "ood_moderate_threshold": cfg.OOD_MODERATE_THRESHOLD,
+            "unified_safety_high": cfg.UNIFIED_SAFETY_HIGH,
+            "unified_safety_moderate": cfg.UNIFIED_SAFETY_MODERATE,
+        },
+        "threshold_policy": result.get("threshold_policy") or _build_threshold_policy(job.get("model_key")),
+        "artifacts": result.get("artifacts") or _build_result_artifacts(job_id, result),
+        "retrieval_summary": result.get("retrieval") or {},
+    }
+
+
+def _fmt_pdf_value(value, default="N/A"):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    if isinstance(value, float):
+        return f"{value:.4f}"
+    return str(value)
+
+
+def _fmt_pdf_percent(value, default="N/A"):
+    if value is None:
+        return default
+    try:
+        return f"{float(value) * 100:.1f}%"
+    except (TypeError, ValueError):
+        return default
+
+
+def _pdf_escape_text(value):
+    from xml.sax.saxutils import escape
+
+    return escape(str(value or ""))
+
+
+def _pdf_image_flowable(path, max_width, max_height):
+    if not path or not Path(path).exists():
+        return None
+    from reportlab.platypus import Image as PdfImage
+
+    try:
+        with Image.open(path) as im:
+            width, height = im.size
+        scale = min(max_width / max(width, 1), max_height / max(height, 1))
+        img = PdfImage(str(path))
+        img.drawWidth = width * scale
+        img.drawHeight = height * scale
+        return img
+    except Exception as exc:
+        logger.warning("Could not embed PDF image %s: %s", path, exc)
+        return None
+
+
+def _pdf_table(rows, col_widths=None, header=True):
+    from reportlab.lib import colors
+    from reportlab.platypus import Table, TableStyle
+
+    table = Table(rows, colWidths=col_widths, hAlign="LEFT")
+    style = [
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D8DEE9")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+        ("LEADING", (0, 0), (-1, -1), 10),
+        ("ROWBACKGROUNDS", (0, 1 if header else 0), (-1, -1), [colors.white, colors.HexColor("#F7F9FC")]),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]
+    if header:
+        style.extend([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#182033")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ])
+    table.setStyle(TableStyle(style))
+    return table
+
+
+def _pdf_footer(canvas, doc):
+    from reportlab.lib import colors
+
+    canvas.saveState()
+    canvas.setStrokeColor(colors.HexColor("#CBD5E1"))
+    canvas.line(doc.leftMargin, 32, doc.pagesize[0] - doc.rightMargin, 32)
+    canvas.setFont("Helvetica", 8)
+    canvas.setFillColor(colors.HexColor("#64748B"))
+    canvas.drawString(doc.leftMargin, 20, "SkinSight WSI decision-support report - not a standalone clinical diagnosis")
+    canvas.drawRightString(doc.pagesize[0] - doc.rightMargin, 20, f"Page {doc.page}")
+    canvas.restoreState()
+
+
+def _build_pdf_report(job_id, export_data):
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.lib.units import inch
+        from reportlab.platypus import (
+            PageBreak,
+            Paragraph,
+            SimpleDocTemplate,
+            Spacer,
+            Table,
+            TableStyle,
+        )
+    except ImportError as exc:
+        raise RuntimeError("PDF export requires reportlab. Install app requirements with `pip install -r app/requirements.txt`.") from exc
+
+    result = export_data["result"]
+    safety = result.get("safety") or {}
+    slide_info = export_data.get("slide_info") or {}
+    retrieval = result.get("retrieval") or {}
+    feature_cost = result.get("feature_cost_profile") or {}
+    details = result.get("calculation_details") or {}
+    out_dir = RESULTS_DIR / job_id
+    pdf_path = out_dir / "skinsight_report.pdf"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(
+        name="SkinTitle",
+        parent=styles["Title"],
+        fontName="Helvetica-Bold",
+        fontSize=22,
+        leading=26,
+        textColor=colors.HexColor("#101828"),
+        spaceAfter=8,
+    ))
+    styles.add(ParagraphStyle(
+        name="SkinH2",
+        parent=styles["Heading2"],
+        fontName="Helvetica-Bold",
+        fontSize=13,
+        leading=16,
+        textColor=colors.HexColor("#1D4ED8"),
+        spaceBefore=12,
+        spaceAfter=6,
+    ))
+    styles.add(ParagraphStyle(
+        name="SkinBody",
+        parent=styles["BodyText"],
+        fontName="Helvetica",
+        fontSize=9.5,
+        leading=13,
+        textColor=colors.HexColor("#334155"),
+        spaceAfter=6,
+    ))
+    styles.add(ParagraphStyle(
+        name="SkinSmall",
+        parent=styles["BodyText"],
+        fontName="Helvetica",
+        fontSize=8,
+        leading=10,
+        textColor=colors.HexColor("#64748B"),
+    ))
+    styles.add(ParagraphStyle(
+        name="Finding",
+        parent=styles["BodyText"],
+        fontName="Helvetica-Bold",
+        fontSize=10,
+        leading=13,
+        textColor=colors.HexColor("#111827"),
+        backColor=colors.HexColor("#EEF6FF"),
+        borderPadding=7,
+        spaceAfter=8,
+    ))
+
+    story = []
+    story.append(Paragraph("SkinSight WSI Analysis Report", styles["SkinTitle"]))
+    story.append(Paragraph(
+        "Melanoma-safe weakly supervised whole-slide image decision-support output.",
+        styles["SkinBody"],
+    ))
+    story.append(_pdf_table([
+        ["Field", "Value"],
+        ["Report ID", job_id],
+        ["Slide", export_data.get("filename") or "unknown"],
+        ["Analysis date", export_data.get("analysis_date") or result.get("timestamp") or "N/A"],
+        ["Model", export_data.get("model") or result.get("model_used") or "N/A"],
+        ["Displayed decision", result.get("prediction") or "N/A"],
+        ["Raw model prediction", result.get("raw_prediction") or "N/A"],
+        ["Decision status", result.get("decision_status") or safety.get("decision_status") or "N/A"],
+    ], col_widths=[1.65 * inch, 4.7 * inch]))
+    story.append(Spacer(1, 8))
+
+    finding = safety.get("recommendation") or "No safety recommendation was returned."
+    risk = safety.get("risk_level") or "N/A"
+    story.append(Paragraph(_pdf_escape_text(f"Main finding: {result.get('prediction', 'N/A')} | Risk: {risk}"), styles["Finding"]))
+    story.append(Paragraph(_pdf_escape_text(finding), styles["SkinBody"]))
+    story.append(Paragraph(
+        "This report is generated for review, teaching, and audit. It is not a replacement for a pathologist's final diagnosis.",
+        styles["SkinSmall"],
+    ))
+
+    thumb_path = out_dir / "thumbnail.jpg"
+    default_heatmap = result.get("default_heatmap_view") or "attention"
+    heatmap_path, _, _ = _heatmap_asset_paths(job_id, default_heatmap)
+    thumb = _pdf_image_flowable(thumb_path, 2.7 * inch, 2.0 * inch)
+    heat = _pdf_image_flowable(heatmap_path, 3.4 * inch, 2.4 * inch)
+    image_cells = []
+    labels = []
+    if thumb:
+        image_cells.append(thumb)
+        labels.append("Slide thumbnail")
+    if heat:
+        image_cells.append(heat)
+        labels.append(f"Heatmap: {default_heatmap}")
+    if image_cells:
+        story.append(Paragraph("Visual Summary", styles["SkinH2"]))
+        story.append(_pdf_table([labels, image_cells], header=True))
+
+    story.append(Paragraph("Prediction Probabilities", styles["SkinH2"]))
+    prob_rows = [["Class", "Probability"]]
+    for class_name, prob in sorted((result.get("probabilities") or {}).items(), key=lambda kv: kv[1], reverse=True):
+        prob_rows.append([class_name, _fmt_pdf_percent(prob)])
+    story.append(_pdf_table(prob_rows, col_widths=[3.0 * inch, 1.3 * inch]))
+
+    story.append(Paragraph("Safety and Triage Findings", styles["SkinH2"]))
+    ood = safety.get("ood") or {}
+    flags = safety.get("flags") or []
+    safety_rows = [
+        ["Signal", "Value"],
+        ["Risk level", risk],
+        ["Abstain recommended", _fmt_pdf_value(safety.get("abstain_recommended"))],
+        ["Confidence", _fmt_pdf_percent(safety.get("confidence"))],
+        ["Uncertainty", _fmt_pdf_percent(safety.get("uncertainty"))],
+        ["Margin", _fmt_pdf_percent(safety.get("margin"))],
+        ["Melanoma probability", _fmt_pdf_percent(safety.get("melanoma_probability"))],
+        ["Safety score", _fmt_pdf_percent(safety.get("safety_score"))],
+        ["OOD level", ood.get("ood_level") or "N/A"],
+        ["OOD score", _fmt_pdf_percent(ood.get("ood_score"))],
+        ["Safety flags", ", ".join(flags) if flags else "None"],
+    ]
+    story.append(_pdf_table(safety_rows, col_widths=[2.25 * inch, 4.1 * inch]))
+
+    if feature_cost:
+        story.append(Paragraph("Cost-Aware Ensemble Profile", styles["SkinH2"]))
+        cost_rows = [
+            ["Metric", "Value"],
+            ["Mode", feature_cost.get("mode") or "N/A"],
+            ["Tile budget", _fmt_pdf_value(feature_cost.get("tile_budget"))],
+            ["Tiles used", _fmt_pdf_value(feature_cost.get("tiles_used"))],
+            ["Models run", ", ".join(feature_cost.get("model_names_run") or [])],
+            ["Models skipped", ", ".join(feature_cost.get("models_skipped") or []) or "None"],
+            ["Actual tile encoder calls", _fmt_pdf_value(feature_cost.get("actual_tile_encoder_calls"))],
+            ["Full 3-model baseline calls", _fmt_pdf_value(feature_cost.get("fixed_3model_200tile_baseline_calls"))],
+            ["Cost ratio vs full 3-model baseline", _fmt_pdf_percent(feature_cost.get("cost_ratio_vs_3model_200tile_baseline"))],
+            ["Reduction vs same-slide full candidate", _fmt_pdf_percent((feature_cost.get("estimated_reduction_percent_vs_same_slide_full") or 0) / 100.0)],
+        ]
+        story.append(_pdf_table(cost_rows, col_widths=[2.55 * inch, 3.8 * inch]))
+
+        decisions = feature_cost.get("gating_decisions") or []
+        if decisions:
+            decision_rows = [["Step", "Model", "Averaged prediction", "Conf.", "Margin", "P(Mel)", "Action"]]
+            for item in decisions:
+                action = "Escalate" if item.get("escalated") else "Stop"
+                decision_rows.append([
+                    _fmt_pdf_value(item.get("step")),
+                    item.get("last_model_display") or item.get("last_model_key") or "N/A",
+                    item.get("averaged_prediction") or "N/A",
+                    _fmt_pdf_percent(item.get("confidence")),
+                    _fmt_pdf_percent(item.get("margin")),
+                    _fmt_pdf_percent(item.get("melanoma_probability")),
+                    action,
+                ])
+            story.append(Spacer(1, 6))
+            story.append(_pdf_table(decision_rows, col_widths=[0.45 * inch, 1.15 * inch, 1.35 * inch, 0.7 * inch, 0.7 * inch, 0.7 * inch, 0.75 * inch]))
+
+    if result.get("ensemble_details"):
+        story.append(Paragraph("Ensemble Breakdown", styles["SkinH2"]))
+        ens_rows = [["Model", "Prediction", "Top confidence", "Feature time", "MIL time"]]
+        for item in result.get("ensemble_details") or []:
+            probs = item.get("probabilities") or {}
+            top_conf = max(probs.values()) if probs else None
+            ens_rows.append([
+                item.get("model") or "N/A",
+                item.get("prediction") or "N/A",
+                _fmt_pdf_percent(top_conf),
+                f"{item.get('feature_extraction_seconds', 'N/A')} s",
+                f"{item.get('mil_inference_seconds', 'N/A')} s",
+            ])
+        story.append(_pdf_table(ens_rows, col_widths=[2.0 * inch, 1.2 * inch, 1.0 * inch, 1.0 * inch, 0.8 * inch]))
+
+    if retrieval and retrieval.get("available"):
+        story.append(Paragraph("Similar-Case Retrieval", styles["SkinH2"]))
+        ret_details = retrieval.get("details") or {}
+        ret_cost = ret_details.get("cost") or {}
+        continual_memory = retrieval.get("continual_memory") or {}
+        story.append(Paragraph(
+            _pdf_escape_text(ret_details.get("summary") or "Similar cases are retrieved from the reference bank."),
+            styles["SkinBody"],
+        ))
+        ret_rows = [
+            ["Bank", retrieval.get("bank_display") or retrieval.get("bank_key") or "N/A"],
+            ["Reference cases", _fmt_pdf_value(retrieval.get("bank_size"))],
+            ["Pending memory cases", _fmt_pdf_value(continual_memory.get("eligible_cases"))],
+            ["Pending memory status", continual_memory.get("verification_status") or "N/A"],
+            ["Hard melanoma cases", _fmt_pdf_value(retrieval.get("hard_case_count"))],
+            ["Active metric", ret_details.get("metric") or "N/A"],
+            ["Cost ratio vs full cosine", _fmt_pdf_percent(ret_cost.get("cost_ratio_vs_full_cosine"))],
+            ["Estimated retrieval cost reduction", _fmt_pdf_percent((ret_cost.get("estimated_cost_reduction_percent") or 0) / 100.0)],
+        ]
+        story.append(_pdf_table([["Retrieval field", "Value"], *ret_rows], col_widths=[2.35 * inch, 4.0 * inch]))
+        similar = retrieval.get("similar_cases") or []
+        if similar:
+            sim_rows = [["Rank", "Slide ID", "Label", "Source", "Similarity"]]
+            for idx, case in enumerate(similar[:5], start=1):
+                sim_rows.append([
+                    str(idx),
+                    case.get("slide_id") or case.get("filename") or "N/A",
+                    case.get("true_label") or "N/A",
+                    case.get("source") or "N/A",
+                    _fmt_pdf_percent(case.get("similarity")),
+                ])
+            story.append(Spacer(1, 6))
+            story.append(_pdf_table(sim_rows, col_widths=[0.45 * inch, 2.65 * inch, 0.85 * inch, 1.0 * inch, 0.85 * inch]))
+        continual = retrieval.get("continual_cases") or []
+        if continual:
+            story.append(Spacer(1, 6))
+            story.append(Paragraph(
+                "Pending continual-memory cases below are previous local analyses. Their labels are model predictions, not verified pathology labels.",
+                styles["SkinSmall"],
+            ))
+            mem_rows = [["Rank", "Slide ID", "Predicted label", "Status", "Similarity"]]
+            for idx, case in enumerate(continual[:3], start=1):
+                mem_rows.append([
+                    str(idx),
+                    case.get("slide_id") or case.get("filename") or "N/A",
+                    case.get("predicted_label") or case.get("true_label") or "N/A",
+                    case.get("verification_status") or "unverified",
+                    _fmt_pdf_percent(case.get("similarity")),
+                ])
+            story.append(_pdf_table(mem_rows, col_widths=[0.45 * inch, 2.4 * inch, 1.05 * inch, 1.0 * inch, 0.85 * inch]))
+
+    top_tiles = result.get("top_tiles") or []
+    if top_tiles:
+        story.append(Paragraph(result.get("top_tiles_title") or "Top Attention Tiles", styles["SkinH2"]))
+        tile_imgs = []
+        tile_labels = []
+        for tile in top_tiles[:4]:
+            tile_path = out_dir / "tiles" / f"tile_{int(tile.get('tile_index', 0)):04d}.jpg"
+            img = _pdf_image_flowable(tile_path, 1.35 * inch, 1.35 * inch)
+            if img:
+                tile_imgs.append(img)
+                score = tile.get("shared_score", tile.get("attention"))
+                tile_labels.append(f"#{tile.get('rank')} | {_fmt_pdf_percent(score)}")
+        if tile_imgs:
+            story.append(_pdf_table([tile_labels, tile_imgs], header=True))
+
+    story.append(PageBreak())
+    story.append(Paragraph("Technical Appendix", styles["SkinTitle"]))
+    pipeline = (details.get("pipeline") or {})
+    if pipeline:
+        story.append(Paragraph("Pipeline audit trail", styles["SkinH2"]))
+        story.append(Paragraph(_pdf_escape_text(pipeline.get("summary") or ""), styles["SkinBody"]))
+        stages = pipeline.get("stages") or []
+        stage_rows = [["Stage", "Purpose / output"]]
+        for stage in stages:
+            outputs = stage.get("outputs") or {}
+            compact_outputs = "; ".join(f"{k}={_fmt_pdf_value(v)}" for k, v in list(outputs.items())[:5])
+            stage_rows.append([stage.get("stage") or "N/A", f"{stage.get('description') or ''} {compact_outputs}"])
+        story.append(_pdf_table(stage_rows, col_widths=[1.7 * inch, 4.65 * inch]))
+
+    prediction_detail = details.get("prediction") or {}
+    if prediction_detail:
+        story.append(Paragraph("Prediction formulae", styles["SkinH2"]))
+        formulas = prediction_detail.get("formulae") or []
+        for formula in formulas[:8]:
+            story.append(Paragraph(_pdf_escape_text(f"- {formula}"), styles["SkinBody"]))
+
+    if retrieval and retrieval.get("details"):
+        story.append(Paragraph("Retrieval formulae", styles["SkinH2"]))
+        for formula in (retrieval.get("details") or {}).get("formulae", [])[:8]:
+            story.append(Paragraph(_pdf_escape_text(f"- {formula}"), styles["SkinBody"]))
+
+    story.append(Paragraph("Limitations", styles["SkinH2"]))
+    for item in [
+        "The output is retrospective decision support, not autonomous diagnosis.",
+        "Attention heatmaps indicate model influence, not pixel-level tumor segmentation.",
+        "Retrieved cases are explanatory analogues, not labels for the query slide.",
+        "OOD detection is implemented as a safety signal but is not yet deployment-grade.",
+    ]:
+        story.append(Paragraph(_pdf_escape_text(f"- {item}"), styles["SkinBody"]))
+
+    doc = SimpleDocTemplate(
+        str(pdf_path),
+        pagesize=A4,
+        rightMargin=36,
+        leftMargin=36,
+        topMargin=36,
+        bottomMargin=44,
+        title=f"SkinSight Report {job_id}",
+        author="SkinSight",
+    )
+    doc.build(story, onFirstPage=_pdf_footer, onLaterPages=_pdf_footer)
+    return pdf_path
 
 
 def _build_result_calculation_details(result, slide_info):
@@ -2544,9 +3500,10 @@ def _build_result_calculation_details(result, slide_info):
     heatmap_views = result.get("heatmap_views") or []
     top_tiles = result.get("top_tiles") or []
     ensemble_details = result.get("ensemble_details") or []
+    feature_cost_profile = result.get("feature_cost_profile") or {}
     model_key = result.get("model_key")
     if model_key in ENSEMBLE_PRESETS:
-        model_kind = "ensemble"
+        model_kind = "gated ensemble" if ENSEMBLE_PRESETS[model_key].get("gated") else "ensemble"
         model_components = ENSEMBLE_PRESETS[model_key].get("models", [])
         model_feature_dim = "concatenated component bag embeddings"
     else:
@@ -2615,6 +3572,23 @@ def _build_result_calculation_details(result, slide_info):
                         "model_kind": model_kind,
                         "feature_dim": model_feature_dim,
                         "ensemble_components": model_components,
+                        "models_run": feature_cost_profile.get("models_run"),
+                        "actual_tile_encoder_calls": feature_cost_profile.get("actual_tile_encoder_calls"),
+                        "cost_ratio_vs_3model_200tile_baseline": feature_cost_profile.get("cost_ratio_vs_3model_200tile_baseline"),
+                    },
+                },
+                {
+                    "stage": "Feature-cost gating",
+                    "description": "For the gated ensemble, the app keeps the tile budget fixed at 200 but conditionally skips extra encoders when the current averaged prediction is confident and melanoma-safe.",
+                    "formula": "actual_tile_encoder_calls = tiles_used * number_of_models_run; escalate if confidence < 0.70 OR margin < 0.20 OR non-melanoma P(Melanoma) >= 0.20",
+                    "outputs": {
+                        "mode": feature_cost_profile.get("mode"),
+                        "tile_budget": feature_cost_profile.get("tile_budget"),
+                        "tiles_used": feature_cost_profile.get("tiles_used"),
+                        "models_run": feature_cost_profile.get("model_names_run"),
+                        "models_skipped": feature_cost_profile.get("models_skipped"),
+                        "cost_ratio_vs_same_slide_full": feature_cost_profile.get("cost_ratio_vs_same_slide_full_candidate_ensemble"),
+                        "cost_ratio_vs_3model_200tile": feature_cost_profile.get("cost_ratio_vs_3model_200tile_baseline"),
                     },
                 },
                 {
@@ -2644,6 +3618,8 @@ def _build_result_calculation_details(result, slide_info):
                         "bank": retrieval.get("bank_display") or retrieval.get("bank_key"),
                         "bank_size": retrieval.get("bank_size"),
                         "top_k": len(retrieval.get("similar_cases") or []),
+                        "pending_memory_cases": (retrieval.get("continual_memory") or {}).get("eligible_cases"),
+                        "pending_memory_returned": len(retrieval.get("continual_cases") or []),
                     },
                 },
             ],
@@ -2740,6 +3716,47 @@ def _build_result_calculation_details(result, slide_info):
             ],
         },
     }
+
+    if feature_cost_profile:
+        details["feature_cost"] = {
+            "title": feature_cost_profile.get("title", "Feature extraction cost profile"),
+            "summary": feature_cost_profile.get("summary"),
+            "clinical_context": [
+                "The cost gate does not change the tissue tile budget or the pathology classes. It changes how many encoders are allowed to spend compute on the same tile bag.",
+                "The melanoma guard keeps the system conservative: if melanoma probability remains clinically relevant under a non-melanoma prediction, the next pathology encoder is invoked instead of stopping early."
+            ],
+            "technical_context": [
+                "Feature extraction dominates runtime because every invoked encoder must transform every retained tile into a high-dimensional vector.",
+                "The selected gated policy was chosen from the Phase 9 proxy profile because it preserved melanoma sensitivity while reducing the average number of encoders per slide.",
+                "Retrieval bank selection follows the invoked model subset, so a UNI-only gated stop uses the UNI bank, a UNI+Phikon stop uses the 2-model bank, and a full run uses the 3-model bank."
+            ],
+            "formulae": feature_cost_profile.get("formulae", []),
+            "inputs": {
+                "tile_budget": feature_cost_profile.get("tile_budget"),
+                "tiles_used": feature_cost_profile.get("tiles_used"),
+                "candidate_models": feature_cost_profile.get("candidate_model_names"),
+                "gating_policy": feature_cost_profile.get("gating_policy"),
+            },
+            "outputs": {
+                "mode": feature_cost_profile.get("mode"),
+                "models_run": feature_cost_profile.get("model_names_run"),
+                "models_skipped": feature_cost_profile.get("models_skipped"),
+                "actual_tile_encoder_calls": feature_cost_profile.get("actual_tile_encoder_calls"),
+                "same_slide_full_candidate_tile_encoder_calls": feature_cost_profile.get("same_slide_full_candidate_tile_encoder_calls"),
+                "fixed_3model_200tile_baseline_calls": feature_cost_profile.get("fixed_3model_200tile_baseline_calls"),
+                "cost_ratio_vs_same_slide_full_candidate_ensemble": feature_cost_profile.get("cost_ratio_vs_same_slide_full_candidate_ensemble"),
+                "cost_ratio_vs_3model_200tile_baseline": feature_cost_profile.get("cost_ratio_vs_3model_200tile_baseline"),
+                "estimated_reduction_percent_vs_same_slide_full": feature_cost_profile.get("estimated_reduction_percent_vs_same_slide_full"),
+                "retrieval_target": feature_cost_profile.get("retrieval_target"),
+            },
+            "gating_decisions": feature_cost_profile.get("gating_decisions", []),
+            "model_timings": feature_cost_profile.get("model_timings", []),
+            "replication_steps": feature_cost_profile.get("replication_steps", []),
+            "limitations": [
+                "The production tile budget is still 200; reducing it to 128 or 160 requires a separate real WSI accuracy/timing benchmark.",
+                "The app reports measured wall-time for this machine, but final deployment cost should be rechecked on the target GPU/CPU environment."
+            ],
+        }
 
     if ensemble_details:
         vote_counts = {}
@@ -2972,6 +3989,95 @@ def _record_phase1_inference_case(job_id, slide_path, model_key, model_display, 
 
 # ??????????????????????????????????????????????????? Heatmap â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+def _record_continual_retrieval_case(job_id, slide_path, model_key, model_display, slide_info, result, retrieval_target):
+    if not cfg.CONTINUAL_RETRIEVAL_ENABLED:
+        return
+    # Retrieval-comparison jobs analyze already curated cases; do not feed them
+    # back into local memory as if they were new user-provided slides.
+    if str(job_id).startswith("retrcmp_"):
+        return
+
+    retrieval_target = retrieval_target or {}
+    retrieval_model_key = retrieval_target.get("retrieval_model_key") or model_key
+    query = _build_retrieval_query_embedding(
+        retrieval_model_key,
+        bag_embedding=retrieval_target.get("bag_embedding"),
+        ensemble_model_keys=retrieval_target.get("ensemble_model_keys"),
+        ensemble_bag_embeddings=retrieval_target.get("ensemble_bag_embeddings"),
+    )
+    if query is None or not len(query):
+        logger.warning("Continual retrieval skipped for %s: query embedding unavailable", job_id)
+        return
+
+    query = _normalize_embedding(query).astype(np.float32)
+    embedding_path = CONTINUAL_RETRIEVAL_EMBEDDING_DIR / f"{job_id}.npy"
+    thumbnail_src = RESULTS_DIR / job_id / "thumbnail.jpg"
+    thumbnail_dst = CONTINUAL_RETRIEVAL_THUMB_DIR / f"{job_id}.jpg"
+    probabilities = _probabilities_from_result_dict(result)
+    safety = result.get("safety") or {}
+    retrieval = result.get("retrieval") or {}
+    timestamp = result.get("timestamp") or datetime.now().isoformat()
+
+    record = {
+        "job_id": job_id,
+        "timestamp": timestamp,
+        "slide_id": Path(slide_path).stem,
+        "filename": Path(slide_path).name,
+        "source": "continual_pending_memory",
+        "verification_status": "unverified",
+        "label_source": "model_prediction_unverified",
+        "predicted_label": result.get("raw_prediction") or result.get("prediction"),
+        "display_prediction": result.get("prediction"),
+        "decision_status": result.get("decision_status"),
+        "model_key": model_key,
+        "model_display": model_display,
+        "retrieval_model_key": retrieval_model_key,
+        "retrieval_bank_display": retrieval.get("bank_display") or retrieval_model_key,
+        "embedding_path": str(embedding_path),
+        "embedding_dim": int(query.shape[0]),
+        "probabilities": probabilities,
+        "hard_case_candidate": bool(safety.get("hard_case_candidate") or safety.get("abstain_recommended")),
+        "safety_summary": {
+            "risk_level": safety.get("risk_level"),
+            "decision_status": safety.get("decision_status"),
+            "confidence": safety.get("confidence"),
+            "margin": safety.get("margin"),
+            "melanoma_probability": safety.get("melanoma_probability"),
+            "safety_score": safety.get("safety_score"),
+            "abstain_recommended": safety.get("abstain_recommended"),
+        },
+        "slide_info": {
+            "width": slide_info.get("width"),
+            "height": slide_info.get("height"),
+            "mpp": slide_info.get("mpp"),
+            "level_count": slide_info.get("level_count"),
+            "vendor": slide_info.get("vendor"),
+        },
+    }
+
+    try:
+        with continual_retrieval_lock:
+            CONTINUAL_RETRIEVAL_EMBEDDING_DIR.mkdir(parents=True, exist_ok=True)
+            CONTINUAL_RETRIEVAL_THUMB_DIR.mkdir(parents=True, exist_ok=True)
+            np.save(str(embedding_path), query)
+            if thumbnail_src.exists():
+                shutil.copy2(str(thumbnail_src), str(thumbnail_dst))
+                record["thumbnail_path"] = str(thumbnail_dst)
+
+            records = [
+                existing
+                for existing in _read_continual_retrieval_records_unlocked()
+                if existing.get("job_id") != job_id
+            ]
+            records.append(record)
+            if len(records) > cfg.CONTINUAL_RETRIEVAL_MAX_CASES:
+                records = records[-cfg.CONTINUAL_RETRIEVAL_MAX_CASES:]
+            _write_continual_retrieval_records_unlocked(records)
+        logger.info("Continual retrieval memory recorded: %s -> %s", job_id, retrieval_model_key)
+    except Exception:
+        logger.exception("Failed to record continual retrieval memory for %s", job_id)
+
+
 def _make_clinical_colormap(n=256):
     cmap = np.zeros((n, 3), dtype=np.float32)
     for i in range(n):
@@ -3177,7 +4283,9 @@ def list_models():
             "models": ecfg["models"],
             "f1": ecfg["f1"],
             "auc": ecfg["auc"],
-            "mel_fn": 0,
+            "mel_fn": ecfg.get("mel_fn", 0),
+            "gated": bool(ecfg.get("gated", False)),
+            "gating_policy": ecfg.get("gating_policy"),
             "threshold_policy": threshold_policy,
             "threshold_label": threshold_policy.get("label"),
         })
@@ -3185,7 +4293,7 @@ def list_models():
     return jsonify({
         "models": models,
         "ensembles": ensembles,
-        "default": "ensemble_3_best",
+        "default": DEFAULT_MODEL_KEY,
     })
 
 
@@ -3206,9 +4314,9 @@ def upload_slide():
         return jsonify({"error": f"Unsupported format: {ext}"}), 400
 
     # Model selection
-    model_key = request.form.get("model", "ensemble_3_best")
-    if not model_key.startswith("ensemble") and model_key not in MODEL_REGISTRY:
-        model_key = "ensemble_3_best"
+    model_key = request.form.get("model", DEFAULT_MODEL_KEY)
+    if model_key not in ENSEMBLE_PRESETS and model_key not in MODEL_REGISTRY:
+        model_key = DEFAULT_MODEL_KEY
 
     job_id = str(uuid.uuid4())[:8]
     slide_dir = UPLOAD_DIR / job_id
@@ -3362,15 +4470,23 @@ def serve_retrieval_thumbnail(slide_id):
     return send_file(str(p), mimetype="image/jpeg")
 
 
+@app.route("/api/retrieval/continual/thumbnails/<job_id>.jpg")
+def serve_continual_retrieval_thumbnail(job_id):
+    p = CONTINUAL_RETRIEVAL_THUMB_DIR / f"{job_id}.jpg"
+    if not p.exists():
+        abort(404)
+    return send_file(str(p), mimetype="image/jpeg")
+
+
 @app.route("/api/retrieval/cases/<slide_id>/compare")
 def compare_retrieval_case(slide_id):
     case_meta = _get_retrieval_case_meta(slide_id)
     if not case_meta:
         return jsonify({"error": "Retrieval case not found"}), 404
 
-    model_key = request.args.get("model", "ensemble_3_best")
+    model_key = request.args.get("model", DEFAULT_MODEL_KEY)
     if model_key not in ENSEMBLE_PRESETS and model_key not in MODEL_REGISTRY:
-        model_key = "ensemble_3_best"
+        model_key = DEFAULT_MODEL_KEY
     if model_key in ENSEMBLE_PRESETS:
         model_display = ENSEMBLE_PRESETS[model_key]["display"]
     else:
@@ -3447,31 +4563,7 @@ def export_results(job_id):
     if not job or not job.get("result"):
         return jsonify({"error": "No results available"}), 404
 
-    export_data = {
-        "job_id": job_id,
-        "filename": job.get("filename"),
-        "analysis_date": job.get("created_at"),
-        "model": job.get("model_display"),
-        "model_key": job.get("model_key"),
-        "result": job["result"],
-        "slide_info": job.get("slide_info"),
-        "decision_policy": {
-            "abstain_confidence_threshold": cfg.ABSTAIN_CONFIDENCE_THRESHOLD,
-            "high_uncertainty_threshold": cfg.HIGH_UNCERTAINTY_THRESHOLD,
-            "moderate_uncertainty_threshold": cfg.MODERATE_UNCERTAINTY_THRESHOLD,
-            "low_margin_threshold": cfg.LOW_MARGIN_THRESHOLD,
-            "melanoma_borderline_probability": cfg.MELANOMA_BORDERLINE_PROB,
-            "melanoma_high_risk_probability": cfg.MELANOMA_HIGH_RISK_PROB,
-            "ensemble_disagreement_threshold": cfg.ENSEMBLE_DISAGREEMENT_THRESHOLD,
-            "ood_strong_threshold": cfg.OOD_STRONG_THRESHOLD,
-            "ood_moderate_threshold": cfg.OOD_MODERATE_THRESHOLD,
-            "unified_safety_high": cfg.UNIFIED_SAFETY_HIGH,
-            "unified_safety_moderate": cfg.UNIFIED_SAFETY_MODERATE,
-        },
-        "threshold_policy": (job["result"].get("threshold_policy") or _build_threshold_policy(job.get("model_key"))),
-        "artifacts": job["result"].get("artifacts") or _build_result_artifacts(job_id, job["result"]),
-        "retrieval_summary": (job["result"].get("retrieval") or {}),
-    }
+    export_data = _build_export_payload(job_id, job)
 
     export_path = RESULTS_DIR / job_id / "export.json"
     export_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3481,6 +4573,28 @@ def export_results(job_id):
     return send_file(str(export_path), mimetype="application/json",
                      as_attachment=True,
                      download_name=f"skinsight_report_{job_id}.json")
+
+
+@app.route("/api/results/<job_id>/report.pdf")
+def export_pdf_report(job_id):
+    with analyses_lock:
+        job = analyses.get(job_id)
+    if not job or not job.get("result"):
+        return jsonify({"error": "No results available"}), 404
+
+    try:
+        export_data = _build_export_payload(job_id, job)
+        pdf_path = _build_pdf_report(job_id, export_data)
+    except Exception as exc:
+        logger.exception("PDF report generation failed for %s", job_id)
+        return jsonify({"error": f"PDF report generation failed: {exc}"}), 500
+
+    return send_file(
+        str(pdf_path),
+        mimetype="application/pdf",
+        as_attachment=True,
+        download_name=f"skinsight_report_{job_id}.pdf",
+    )
 
 
 @app.route("/api/results/<job_id>/delete", methods=["POST"])
@@ -3534,5 +4648,6 @@ if __name__ == "__main__":
     logger.info(f"Starting SkinSight server on port {port}")
     logger.info(f"  Models: {len(MODEL_REGISTRY)} + Ensemble")
     logger.info(f"  Classes: {', '.join(CLASS_NAMES.values())}")
-    logger.info(f"  Ensemble: {', '.join(MODEL_REGISTRY[m]['name'] for m in ENSEMBLE_MODELS)}")
+    logger.info(f"  Default model: {ENSEMBLE_PRESETS.get(DEFAULT_MODEL_KEY, {}).get('name', DEFAULT_MODEL_KEY)}")
+    logger.info(f"  Default components: {', '.join(MODEL_REGISTRY[m]['name'] for m in ENSEMBLE_PRESETS.get(DEFAULT_MODEL_KEY, {}).get('models', ENSEMBLE_MODELS))}")
     app.run(host="0.0.0.0", port=port, debug=debug, threaded=True)

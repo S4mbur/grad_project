@@ -1061,12 +1061,27 @@ body {
     background: rgba(255, 255, 255, 0.72);
 }
 
+.retrieval-card.unverified {
+    border-color: rgba(180, 83, 9, 0.28);
+    background: rgba(255, 251, 235, 0.82);
+}
+
 .retrieval-thumb {
     width: 72px;
     height: 72px;
     border-radius: 10px;
     object-fit: cover;
     background: var(--bg-active);
+}
+
+.retrieval-thumb-placeholder {
+    display: grid;
+    place-items: center;
+    color: #92400e;
+    font-size: 0.62rem;
+    font-weight: 800;
+    text-align: center;
+    border: 1px dashed rgba(180, 83, 9, 0.35);
 }
 
 .retrieval-card-body {
@@ -1196,6 +1211,11 @@ body {
 .retrieval-flag.hard {
     background: rgba(239, 68, 68, 0.12);
     color: #b91c1c;
+}
+
+.retrieval-flag.pending {
+    background: rgba(245, 158, 11, 0.18);
+    color: #92400e;
 }
 
 .retrieval-empty {

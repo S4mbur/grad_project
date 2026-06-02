@@ -21,7 +21,7 @@ const state = {
     topTilesData: [],
     currentResult: null,
     modelsData: null,    // from /api/models
-    selectedModel: 'ensemble_3_best',
+    selectedModel: 'gated_app_order_cheap_conf70_margin20_mel20',
   };
 
 const API = '';
@@ -157,7 +157,7 @@ async function loadModels() {
         });
 
         // Set default
-        select.value = data.default || 'ensemble_3_best';
+        select.value = data.default || 'gated_app_order_cheap_conf70_margin20_mel20';
         state.selectedModel = select.value;
         updateModelInfo(select.value);
 
@@ -180,7 +180,8 @@ function updateModelInfo(key) {
 
     const ensemble = state.modelsData?.ensembles?.find(e => e.key === key);
     if (ensemble) {
-        f1El.textContent = `F1: ${(ensemble.f1 * 100).toFixed(1)}% | AUC: ${(ensemble.auc * 100).toFixed(1)}% | MelFN: 0`;
+        const melFn = ensemble.mel_fn !== undefined ? ensemble.mel_fn : 0;
+        f1El.textContent = `F1: ${(ensemble.f1 * 100).toFixed(1)}% | AUC: ${(ensemble.auc * 100).toFixed(1)}% | MelFN: ${melFn}`;
         thresholdEl.textContent = formatThresholdPolicy(ensemble.threshold_policy || null);
         descEl.textContent = ensemble.description;
         return;
@@ -338,6 +339,7 @@ function renderCalculationDetail(detail) {
             ${renderKeyValueTable('Inputs', detail.inputs)}
             ${renderKeyValueTable('Thresholds', detail.thresholds)}
             ${renderKeyValueTable('Cost', detail.cost)}
+            ${renderKeyValueTable('Continual memory', detail.continual_memory)}
             ${renderKeyValueTable('Method comparison', detail.method_comparison)}
             ${renderKeyValueTable('Score distribution', detail.score_distribution)}
             ${renderKeyValueTable('OOD', detail.ood)}
@@ -528,7 +530,8 @@ function onAnalysisComplete(jobId, data) {
     // Show slide info bar
     document.getElementById('slide-info-bar').classList.add('active');
 
-    // Show export button
+    // Show export/report buttons
+    document.getElementById('btn-pdf-report').style.display = '';
     document.getElementById('btn-export').style.display = '';
 
     // Update history
@@ -674,10 +677,14 @@ function renderPredictionDetails(result) {
 
 function renderEnsembleCalculationDetails(result) {
     const detail = result?.calculation_details?.ensemble;
+    const featureCost = result?.calculation_details?.feature_cost;
     setCalculationDetails(
         'ensemble-details-block',
         'ensemble-calculation-details',
-        renderCalculationDetail(detail)
+        [
+            renderCalculationDetail(detail),
+            renderCalculationDetail(featureCost),
+        ].filter(Boolean).join('')
     );
 }
 
@@ -739,21 +746,28 @@ function renderRetrievalPanel(retrieval) {
     const grid = document.getElementById('retrieval-grid');
     const hardGrid = document.getElementById('hard-retrieval-grid');
     const hardTitle = document.getElementById('hard-retrieval-title');
+    const continualGrid = document.getElementById('continual-retrieval-grid');
+    const continualTitle = document.getElementById('continual-retrieval-title');
     const summary = document.getElementById('retrieval-summary');
 
-    if (!panel || !grid || !hardGrid || !hardTitle || !summary) return;
+    if (!panel || !grid || !hardGrid || !hardTitle || !continualGrid || !continualTitle || !summary) return;
 
     if (!retrieval || !retrieval.available) {
         panel.style.display = 'none';
         grid.innerHTML = '';
         hardGrid.innerHTML = '';
+        continualGrid.innerHTML = '';
         hardTitle.style.display = 'none';
+        continualTitle.style.display = 'none';
         setCalculationDetails('retrieval-details-block', 'retrieval-details', '');
         return;
     }
 
     panel.style.display = 'block';
-    summary.textContent = `${retrieval.bank_display || retrieval.bank_key} • ${retrieval.bank_size || 0} reference cases • ${retrieval.hard_case_count || 0} hard melanoma cases`;
+    const memory = retrieval.continual_memory || {};
+    const memoryCount = memory.eligible_cases || 0;
+    const memoryReturned = (retrieval.continual_cases || []).length;
+    summary.textContent = `${retrieval.bank_display || retrieval.bank_key} | ${retrieval.bank_size || 0} verified reference cases | ${retrieval.hard_case_count || 0} hard melanoma cases | ${memoryCount} pending memory cases (${memoryReturned} shown)`;
     renderRetrievalDetails(retrieval);
     grid.innerHTML = _renderRetrievalCards(retrieval.similar_cases || [], 'No similar cases available.');
 
@@ -761,6 +775,12 @@ function renderRetrievalPanel(retrieval) {
     hardTitle.style.display = hardCases.length ? 'block' : 'none';
     hardGrid.innerHTML = hardCases.length
         ? _renderRetrievalCards(hardCases, '')
+        : '';
+
+    const continualCases = retrieval.continual_cases || [];
+    continualTitle.style.display = continualCases.length ? 'block' : 'none';
+    continualGrid.innerHTML = continualCases.length
+        ? _renderRetrievalCards(continualCases, '', { unverified: true })
         : '';
 }
 
@@ -773,7 +793,7 @@ function renderRetrievalDetails(retrieval) {
     );
 }
 
-function _renderRetrievalCards(items, emptyText = '') {
+function _renderRetrievalCards(items, emptyText = '', options = {}) {
     if (!items || !items.length) {
         if (!emptyText) return '';
         return `
@@ -784,22 +804,32 @@ function _renderRetrievalCards(items, emptyText = '') {
         `;
     }
 
-    return items.map(item => `
-        <div class="retrieval-card">
-            <img class="retrieval-thumb" src="${API}${item.thumbnail_url}" alt="${item.filename}" loading="lazy">
+    return items.map(item => {
+        const label = item.predicted_label || item.true_label || 'Pending review';
+        const source = item.source || 'unknown source';
+        const filename = item.filename || item.slide_id || item.case_id || 'unknown case';
+        const isUnverified = options.unverified || item.is_continual_memory || item.verification_status === 'unverified';
+        const thumb = item.thumbnail_url
+            ? `<img class="retrieval-thumb" src="${API}${item.thumbnail_url}" alt="${escapeHtml(filename)}" loading="lazy">`
+            : `<div class="retrieval-thumb retrieval-thumb-placeholder">No image</div>`;
+        const compareButton = item.compare_available === false
+            ? ''
+            : `<button class="retrieval-compare-btn" type="button" onclick="compareRetrievedCase('${escapeHtml(item.slide_id)}')">Compare</button>`;
+        return `
+        <div class="retrieval-card ${isUnverified ? 'unverified' : ''}">
+            ${thumb}
             <div class="retrieval-card-body">
                 <div class="retrieval-card-top">
-                    <span class="retrieval-label ${_getClassKey(item.true_label)}">${item.true_label}</span>
+                    <span class="retrieval-label ${_getClassKey(label)}">${escapeHtml(label)}</span>
                     <span class="retrieval-similarity">${((item.similarity || 0) * 100).toFixed(1)}%</span>
                 </div>
-                <div class="retrieval-file">${item.filename || item.slide_id}</div>
-                <div class="retrieval-meta">${item.source || 'unknown source'}</div>
+                <div class="retrieval-file">${escapeHtml(filename)}</div>
+                <div class="retrieval-meta">${escapeHtml(source)}</div>
                 <div class="retrieval-flags">
                     ${item.is_hard_melanoma ? '<span class="retrieval-flag hard">Hard melanoma</span>' : ''}
+                    ${isUnverified ? '<span class="retrieval-flag pending">Unverified memory</span>' : ''}
                 </div>
-                <div class="retrieval-actions">
-                    <button class="retrieval-compare-btn" type="button" onclick="compareRetrievedCase('${item.slide_id}')">Compare</button>
-                </div>
+                ${compareButton ? `<div class="retrieval-actions">${compareButton}</div>` : ''}
                 ${item.detail ? `
                     <details class="retrieval-card-detail">
                         <summary>Similarity details</summary>
@@ -808,7 +838,7 @@ function _renderRetrievalCards(items, emptyText = '') {
                 ` : ''}
             </div>
         </div>
-    `).join('');
+    `}).join('');
 }
 
 function _resolveHeatmapVariant(resultLike, preferredVariant) {
@@ -845,6 +875,7 @@ function _renderCompareSummary(title, meta, jobId, resultLike, preferredVariant)
     const detailHtml = [
         renderCalculationDetail(details.prediction),
         renderCalculationDetail(details.ensemble),
+        renderCalculationDetail(details.feature_cost),
         renderCalculationDetail(safety.details?.phase1),
         renderCalculationDetail(safety.details?.phase2),
         renderCalculationDetail(details.attention),
@@ -1284,6 +1315,15 @@ async function exportResults() {
         return;
     }
     window.open(`${API}/api/results/${state.currentJobId}/export`, '_blank');
+}
+
+async function downloadPdfReport() {
+    if (!state.currentJobId) {
+        showToast('No analysis to report', 'error');
+        return;
+    }
+    showToast('Preparing PDF report...', 'info');
+    window.open(`${API}/api/results/${state.currentJobId}/report.pdf`, '_blank');
 }
 
 // ───────────────── Toasts ──────────────────────────────

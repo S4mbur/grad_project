@@ -36,7 +36,11 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import matplotlib
 import numpy as np
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -58,6 +62,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--registry", type=Path, default=PHASE4_DIR / "retrieval_registry.json")
     p.add_argument("--embeddings", type=Path, default=PHASE4_DIR / "retrieval_embeddings.npz")
     p.add_argument("--output", type=Path, default=PHASE4_DIR / "metric_study" / "phikon_hard_mel_diagnostic.md")
+    p.add_argument("--spectrum-output", type=Path, default=None)
     p.add_argument("--top-k", type=int, default=5, help="Top-K candidates inspected per query")
     p.add_argument("--top-directions", type=int, default=4, help="Number of dominant covariance directions to break the divergence into")
     return p.parse_args()
@@ -91,14 +96,88 @@ def topk(scores: np.ndarray, k: int, exclude: int) -> List[int]:
     return np.argsort(s)[::-1][:k].tolist()
 
 
+def shrunk_class_pooled_covariance(bank: np.ndarray, labels: np.ndarray, shrinkage: float = 0.1) -> np.ndarray:
+    """Mirror app.similarity_metrics.fit_inverse_covariance for diagnostics.
+
+    The diagnostic needs the covariance spectrum, not only the inverse matrix.
+    Keeping this local copy makes the figure exactly comparable to the
+    Mahalanobis matrix used below.
+    """
+    x = np.asarray(bank, dtype=np.float64)
+    labels_arr = np.asarray(labels)
+    covs = []
+    weights = []
+    for c in np.unique(labels_arr):
+        x_c = x[labels_arr == c]
+        if x_c.shape[0] < 2:
+            continue
+        covs.append(np.cov(x_c, rowvar=False, bias=True))
+        weights.append(x_c.shape[0])
+    if covs:
+        weights_arr = np.asarray(weights, dtype=np.float64)
+        cov = sum(w * c for w, c in zip(weights_arr, covs)) / weights_arr.sum()
+    else:
+        cov = np.cov(x, rowvar=False, bias=True)
+    diag_target = np.eye(cov.shape[0]) * float(np.trace(cov) / max(cov.shape[0], 1))
+    return (1.0 - shrinkage) * cov + shrinkage * diag_target
+
+
+def first_hit_rank(order_full: np.ndarray, query_idx: int, labels: np.ndarray, target_label: int) -> int:
+    """Return 1-based rank of the first target-label neighbor, excluding self.
+
+    Previous diagnostic code accidentally removed the item at position
+    ``query_idx`` in the ranking array.  The ranking stores case indices, so
+    self-exclusion must filter values equal to ``query_idx``.
+    """
+    rank = 0
+    for j in order_full:
+        j = int(j)
+        if j == query_idx:
+            continue
+        rank += 1
+        if int(labels[j]) == int(target_label):
+            return rank
+    return max(rank, 1)
+
+
+def plot_eigenspectrum(cov_eigvals: np.ndarray, inv_eigvals: np.ndarray, output: Path) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    cov = np.sort(np.asarray(cov_eigvals, dtype=np.float64))[::-1]
+    inv = np.sort(np.asarray(inv_eigvals, dtype=np.float64))[::-1]
+    cov = np.maximum(cov, 1e-12)
+    inv = np.maximum(inv, 1e-12)
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4), dpi=160)
+    axes[0].plot(np.arange(1, len(cov) + 1), cov, linewidth=1.5)
+    axes[0].set_title("Shrunk covariance eigenvalues")
+    axes[0].set_xlabel("Eigenvalue rank")
+    axes[0].set_ylabel("Eigenvalue")
+    axes[0].set_yscale("log")
+    axes[0].grid(alpha=0.25)
+
+    axes[1].plot(np.arange(1, len(inv) + 1), inv, color="#b44", linewidth=1.5)
+    axes[1].set_title("Inverse-covariance eigenvalues")
+    axes[1].set_xlabel("Eigenvalue rank")
+    axes[1].set_ylabel("Inverse eigenvalue")
+    axes[1].set_yscale("log")
+    axes[1].grid(alpha=0.25)
+
+    fig.suptitle("Phikon Mahalanobis diagnostic spectrum")
+    fig.tight_layout()
+    fig.savefig(output, bbox_inches="tight")
+    plt.close(fig)
+
+
 def main() -> int:
     args = parse_args()
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    spectrum_output = args.spectrum_output or args.output.with_name(args.output.stem + "_eigenspectrum.png")
     bank, labels, hard_flags, case_ids, cases = load_bank(args)
 
     # Compute the metric scores once per query.
     bank_norm = bank / np.maximum(np.linalg.norm(bank, axis=1, keepdims=True), 1e-8)
     inv_cov = smet.fit_inverse_covariance(bank, labels=labels.tolist(), shrinkage=0.1)
+    shrunk_cov = shrunk_class_pooled_covariance(bank, labels, shrinkage=0.1)
 
     # Eigendecomposition of inv_cov for direction-level diagnostic.
     eigvals, eigvecs = np.linalg.eigh(inv_cov.astype(np.float64))
@@ -107,6 +186,9 @@ def main() -> int:
     eigvecs = eigvecs[:, order_eig]
     top_dirs = eigvecs[:, : args.top_directions]
     top_dir_eigvals = eigvals[: args.top_directions]
+    cov_eigvals = np.linalg.eigvalsh(shrunk_cov.astype(np.float64))
+    inv_eigvals_all = np.linalg.eigvalsh(inv_cov.astype(np.float64))
+    plot_eigenspectrum(cov_eigvals, inv_eigvals_all, spectrum_output)
 
     hard_mel_indices = [
         i for i in range(len(case_ids))
@@ -128,6 +210,18 @@ def main() -> int:
     lines.append("decomposition of the offending vector onto the top inverse-")
     lines.append("covariance eigenvectors (the directions Mahalanobis amplifies).")
     lines.append("")
+    lines.append(f"Eigenspectrum figure: `{spectrum_output.as_posix()}`")
+    lines.append("")
+    lines.append("## Covariance Spectrum Summary")
+    lines.append("")
+    positive_cov = cov_eigvals[cov_eigvals > 1e-12]
+    positive_inv = inv_eigvals_all[inv_eigvals_all > 1e-12]
+    effective_rank = float((positive_cov.sum() ** 2) / np.maximum((positive_cov ** 2).sum(), 1e-12))
+    lines.append(f"- Effective covariance rank: {effective_rank:.2f} / {bank.shape[1]}")
+    lines.append(f"- Covariance eigenvalue range: {positive_cov.min():.6e} to {positive_cov.max():.6e}")
+    lines.append(f"- Inverse eigenvalue range: {positive_inv.min():.6e} to {positive_inv.max():.6e}")
+    lines.append("- Direction projections below are shown in scientific notation to avoid hiding small but amplified components.")
+    lines.append("")
 
     cosine_first_hits: List[float] = []
     maha_first_hits: List[float] = []
@@ -143,19 +237,10 @@ def main() -> int:
         cos_order = topk(cos_scores, args.top_k, exclude=q_idx)
         maha_order = topk(-maha_d, args.top_k, exclude=q_idx)
 
-        # First-hit ranks
-        def first_hit(order_full: np.ndarray) -> int:
-            order_full = order_full.copy()
-            order_full[q_idx] = -1  # ignore self
-            for r, j in enumerate(order_full[order_full >= 0], start=1):
-                if labels[j] == CLASS_INDEX["Melanoma"]:
-                    return r
-            return len(order_full)
-
         cos_full = np.argsort(cos_scores)[::-1]
         maha_full = np.argsort(-maha_d)
-        cos_fh = first_hit(cos_full)
-        maha_fh = first_hit(maha_full)
+        cos_fh = first_hit_rank(cos_full, q_idx, labels, CLASS_INDEX["Melanoma"])
+        maha_fh = first_hit_rank(maha_full, q_idx, labels, CLASS_INDEX["Melanoma"])
         cosine_first_hits.append(cos_fh)
         maha_first_hits.append(maha_fh)
         divergence = maha_fh - cos_fh
@@ -208,9 +293,9 @@ def main() -> int:
                 wnm = float(proj_nm[d] ** 2 * top_dir_eigvals[d])
                 wmel = float(proj_mel[d] ** 2 * top_dir_eigvals[d])
                 lines.append(
-                    f"| {d} | {top_dir_eigvals[d]:.3f} | "
-                    f"{float(proj_nm[d]):+.3f} | {float(proj_mel[d]):+.3f} | "
-                    f"non-mel={wnm:.3f}, mel={wmel:.3f} |"
+                    f"| {d} | {top_dir_eigvals[d]:.6e} | "
+                    f"{float(proj_nm[d]):+.6e} | {float(proj_mel[d]):+.6e} | "
+                    f"non-mel={wnm:.6e}, mel={wmel:.6e} |"
                 )
             lines.append("")
             lines.append(
