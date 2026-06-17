@@ -21,6 +21,29 @@ public static class OpenSlideInterop
     // Windows: openslide 4.x uses "libopenslide-1.dll"
     private const string LibName = "libopenslide-1";
 
+    static OpenSlideInterop()
+    {
+        NativeLibrary.SetDllImportResolver(typeof(OpenSlideInterop).Assembly, (libraryName, assembly, searchPath) =>
+        {
+            if (!libraryName.Equals(LibName, StringComparison.OrdinalIgnoreCase))
+                return IntPtr.Zero;
+
+            var candidates = new[]
+            {
+                Path.Combine(AppContext.BaseDirectory, "libopenslide-1.dll"),
+                Path.Combine(AppContext.BaseDirectory, "openslide", "libopenslide-1.dll")
+            };
+
+            foreach (var candidate in candidates)
+            {
+                if (File.Exists(candidate))
+                    return NativeLibrary.Load(candidate);
+            }
+
+            return IntPtr.Zero;
+        });
+    }
+
     // ─── Native function imports ────────────────────────────────────
 
     [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]

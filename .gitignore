@@ -63,6 +63,8 @@ desktop.ini
 *.snm
 *.vrb
 
+poster/*
+
 # Large data files and generated datasets
 data/tiles/
 data/tiles_4class/

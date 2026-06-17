@@ -38,8 +38,8 @@
 
   <!-- Copy OpenSlide Windows DLLs to output if they exist -->
   <ItemGroup>
-    <None Include="openslide\*.dll" CopyToOutputDirectory="PreserveNewest" />
-    <None Include="openslide\*.exe" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="openslide\*.dll" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" TargetPath="%(Filename)%(Extension)" />
+    <None Include="openslide\*.exe" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" TargetPath="%(Filename)%(Extension)" />
   </ItemGroup>
 
 </Project>

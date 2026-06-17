@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.Extensions.FileProviders;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.Formats.Jpeg;
 using SkinSight.Models;
@@ -67,6 +68,11 @@ var app = builder.Build();
 
 app.UseCors();
 app.UseStaticFiles();   // Serve wwwroot/
+app.UseStaticFiles(new StaticFileOptions
+{
+    RequestPath = "/static",
+    FileProvider = new PhysicalFileProvider(app.Environment.WebRootPath)
+});
 
 var logger = app.Services.GetRequiredService<ILogger<Program>>();
 var analysisService = app.Services.GetRequiredService<AnalysisService>();
@@ -77,6 +83,45 @@ var jsonOptions = new JsonSerializerOptions
     PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
 };
+
+ModelInfo CloneModelForResponse(ModelInfo m)
+{
+    var threshold = ModelCatalog.BuildThresholdPolicy(m.Key);
+    return new ModelInfo
+    {
+        Key = m.Key,
+        Name = m.Name,
+        Display = m.Display,
+        Group = m.Group,
+        F1 = m.F1,
+        Auc = m.Auc,
+        MelFn = m.MelFn,
+        Description = m.Description,
+        Available = m.Available,
+        ThresholdPolicy = threshold,
+        ThresholdLabel = threshold.TryGetValue("label", out var label) ? label?.ToString() : null,
+    };
+}
+
+EnsembleInfo CloneEnsembleForResponse(EnsembleInfo e)
+{
+    var threshold = ModelCatalog.BuildThresholdPolicy(e.Key);
+    return new EnsembleInfo
+    {
+        Key = e.Key,
+        Name = e.Name,
+        Display = e.Display,
+        Description = e.Description,
+        Models = e.Models.ToList(),
+        F1 = e.F1,
+        Auc = e.Auc,
+        MelFn = e.MelFn,
+        Gated = e.Gated,
+        GatingPolicy = e.GatingPolicy == null ? null : new Dictionary<string, object?>(e.GatingPolicy),
+        ThresholdPolicy = threshold,
+        ThresholdLabel = threshold.TryGetValue("label", out var label) ? label?.ToString() : null,
+    };
+}
 
 // ═══════════════════════════════════════════════════════════════
 //  ROUTES
@@ -90,30 +135,22 @@ app.MapGet("/", () => Results.File(
 
 // ─── Models ────────────────────────────────────────────────────
 
-var modelRegistry = new List<ModelInfo>
-{
-    new() { Key = "phikon",     Name = "Phikon",          Display = "Phikon (Pathology Foundation)",      F1 = 0.9250, Auc = 0.9811, Description = "Pathology-specialized ViT, highest F1 (92.5%)",    Available = true },
-    new() { Key = "convnext_s", Name = "ConvNeXt-Small",  Display = "ConvNeXt-Small",             F1 = 0.8716, Auc = 0.9551, Description = "Modern CNN, strong performer (87.2% F1)",          Available = true },
-    new() { Key = "convnext_b", Name = "ConvNeXt-Base",   Display = "ConvNeXt-Base",              F1 = 0.8681, Auc = 0.9663, Description = "Larger ConvNeXt, high AUC (96.6%)",              Available = true },
-    new() { Key = "dinov2",     Name = "DINOv2-Base",     Display = "DINOv2-Base (Self-Supervised)", F1 = 0.8198, Auc = 0.9477, Description = "Self-supervised ViT from Meta (82.0% F1)",   Available = true },
-    new() { Key = "resnet18",   Name = "ResNet18",       Display = "ResNet18 (Baseline)",       F1 = 0.8155, Auc = 0.9414, Description = "Lightweight baseline CNN (81.6% F1)",     Available = true },
-    new() { Key = "resnet50",   Name = "ResNet50",       Display = "ResNet50",       F1 = 0.7988, Auc = 0.9404, Description = "Deeper ResNet (79.9% F1)",         Available = true },
-};
-
 app.MapGet("/api/models", () =>
 {
+    var models = ModelCatalog.Models
+        .OrderByDescending(m => m.F1)
+        .Select(CloneModelForResponse)
+        .ToList();
+    var ensembles = ModelCatalog.Ensembles
+        .Select(CloneEnsembleForResponse)
+        .ToList();
+
     var response = new ModelsResponse
     {
-        Models = modelRegistry,
-        Default = "phikon",
-        Ensemble = new EnsembleInfo
-        {
-            Key = "ensemble",
-            Name = "Ensemble",
-            Display = "Ensemble (Top-3 Models)",
-            Description = "Averages Phikon + ConvNeXt-Small + ConvNeXt-Base",
-            Models = new List<string> { "phikon", "convnext_s", "convnext_b" },
-        }
+        Models = models,
+        Ensembles = ensembles,
+        Ensemble = ensembles.FirstOrDefault(e => e.Key == "ensemble_3_best"),
+        Default = ModelCatalog.DefaultModelKey,
     };
     return Results.Json(response, jsonOptions);
 });
@@ -146,11 +183,10 @@ app.MapPost("/api/upload", async (HttpRequest request) =>
     }
 
     // Read model selection
-    var modelKey = form.ContainsKey("model") ? form["model"].ToString() : "phikon";
-    var modelInfo = modelRegistry.FirstOrDefault(m => m.Key == modelKey);
-    var modelDisplay = modelKey == "ensemble"
-        ? "Ensemble (Top-3 Models)"
-        : modelInfo?.Display ?? modelKey;
+    var modelKey = form.ContainsKey("model") ? form["model"].ToString() : ModelCatalog.DefaultModelKey;
+    if (!ModelCatalog.IsKnownKey(modelKey))
+        modelKey = ModelCatalog.DefaultModelKey;
+    var modelDisplay = ModelCatalog.DisplayFor(modelKey);
 
     var fileSizeMb = Math.Round(new FileInfo(slidePath).Length / (1024.0 * 1024.0), 1);
     logger.LogInformation("Uploaded {Filename} ({SizeMb} MB) -> {JobId} [model: {Model}]",
@@ -265,9 +301,29 @@ app.MapGet("/api/results/{jobId}/heatmap", (string jobId) =>
         : Results.NotFound();
 });
 
+app.MapGet("/api/results/{jobId}/heatmap/{variant}", (string jobId, string variant) =>
+{
+    var specific = Path.Combine(analysisService.ResultsDir, jobId, $"{variant}_heatmap.jpg");
+    var fallback = Path.Combine(analysisService.ResultsDir, jobId, "heatmap.jpg");
+    var path = File.Exists(specific) ? specific : fallback;
+    return File.Exists(path)
+        ? Results.File(path, "image/jpeg")
+        : Results.NotFound();
+});
+
 app.MapGet("/api/results/{jobId}/heatmap_only", (string jobId) =>
 {
     var path = Path.Combine(analysisService.ResultsDir, jobId, "heatmap_only.png");
+    return File.Exists(path)
+        ? Results.File(path, "image/png")
+        : Results.NotFound();
+});
+
+app.MapGet("/api/results/{jobId}/heatmap_only/{variant}", (string jobId, string variant) =>
+{
+    var specific = Path.Combine(analysisService.ResultsDir, jobId, $"{variant}_heatmap_only.png");
+    var fallback = Path.Combine(analysisService.ResultsDir, jobId, "heatmap_only.png");
+    var path = File.Exists(specific) ? specific : fallback;
     return File.Exists(path)
         ? Results.File(path, "image/png")
         : Results.NotFound();
@@ -287,6 +343,31 @@ app.MapGet("/api/results/{jobId}/tiles/{filename}", (string jobId, string filena
     return File.Exists(path)
         ? Results.File(path, "image/jpeg")
         : Results.NotFound();
+});
+
+app.MapGet("/api/retrieval/thumbnails/{slideId}.jpg", (string slideId) =>
+{
+    var projectDir = Path.GetFullPath(Path.Combine(app.Environment.ContentRootPath, ".."));
+    var path = Path.Combine(projectDir, "results", "phase4_retrieval", "thumbnails", $"{slideId}.jpg");
+    return File.Exists(path)
+        ? Results.File(path, "image/jpeg")
+        : Results.NotFound();
+});
+
+app.MapGet("/api/retrieval/continual/thumbnails/{jobId}.jpg", (string jobId) =>
+{
+    var path = Path.Combine(analysisService.ResultsDir, jobId, "thumbnail.jpg");
+    return File.Exists(path)
+        ? Results.File(path, "image/jpeg")
+        : Results.NotFound();
+});
+
+app.MapGet("/api/retrieval/cases/{slideId}/compare", (string slideId) =>
+{
+    return Results.NotFound(new
+    {
+        error = "Retrieval case comparison is implemented in the Flask runtime. The .NET port serves the updated UI and compatibility retrieval summaries."
+    });
 });
 
 // ─── History ───────────────────────────────────────────────────
@@ -333,6 +414,14 @@ app.MapGet("/api/results/{jobId}/export", (string jobId) =>
 
     return Results.File(exportPath, "application/json",
         $"skinsight_report_{jobId}.json");
+});
+
+app.MapGet("/api/results/{jobId}/report.pdf", (string jobId) =>
+{
+    var pdfPath = analysisService.BuildPdfReport(jobId);
+    return pdfPath != null && File.Exists(pdfPath)
+        ? Results.File(pdfPath, "application/pdf", $"skinsight_report_{jobId}.pdf")
+        : Results.NotFound(new { error = "No PDF report available" });
 });
 
 // ─── Delete ────────────────────────────────────────────────────
@@ -390,8 +479,9 @@ app.MapGet("/api/info", () =>
         Jobs = analysisService.Jobs.Count,
         UploadsMb = Math.Round(uploadSize / 1e6, 1),
         ResultsMb = Math.Round(resultsSize / 1e6, 1),
-        NModels = modelRegistry.Count,
+        NModels = ModelCatalog.Models.Count,
         Classes = ClassInfo.Names.Values.ToList(),
+        RetrievalBanks = new List<string> { "phase4_reference_bank", "dotnet_compatibility_summary" },
     }, jsonOptions);
 });
 
