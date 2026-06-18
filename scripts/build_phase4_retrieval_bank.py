@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -23,7 +24,9 @@ SOURCE_CSV = PROJECT_DIR / "results" / "phase1_hard_case_bank" / "all_test_predi
 HARD_CASE_CSV = PROJECT_DIR / "results" / "phase1_hard_case_bank" / "hard_case_bank.csv"
 REGISTRY_JSON = PHASE4_DIR / "retrieval_registry.json"
 EMBEDDINGS_NPZ = PHASE4_DIR / "retrieval_embeddings.npz"
-FEATURE_ROOT = Path("/mnt/d/skin_cancer_project/cache")
+FEATURE_ROOT = Path(
+    os.environ.get("SKINSIGHT_CACHE_ROOT", "/mnt/d/skin_cancer_project/cache")
+).expanduser()
 DEFAULT_MODELS = [
     "uni_cost_sensitive_strong",
     "phikon_cost_sensitive_strong",

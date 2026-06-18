@@ -3,10 +3,8 @@ similarity_metrics.py
 =====================
 Vector similarity metrics tailored to the SkinSight MIL pipeline.
 
-Drop this file at ``app/similarity_metrics.py`` inside the phase1_project
-repository.  It is imported by both the experiment harness
-(``scripts/experiment_similarity_metrics.py``) and the Flask server
-(``app/server.py``).
+This module is shared by the Flask server and the offline retrieval
+evaluations.
 
 The module collects the metrics studied in the
 "Algebra-aware Similarity Search for Skin Pathology" experiment.

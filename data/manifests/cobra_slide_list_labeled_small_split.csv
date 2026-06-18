@@ -1,3 +1,0 @@
-slide_id,patient_id,split,local_path,label,source
-3ce97d14a8543b0a90ce8c928d387ed3,3ce97d14a8543b0a90ce8c928d387ed3,test,data/raw_wsi/3ce97d14a8543b0a90ce8c928d387ed3.tif,malignant,cobra_bcc
-da629bc153ef3caf816e4aee0c72a3ea,da629bc153ef3caf816e4aee0c72a3ea,train,data/raw_wsi/da629bc153ef3caf816e4aee0c72a3ea.tif,malignant,cobra_bcc

@@ -1,3 +1,0 @@
-slide_id,patient_id,split,local_path,label
-a221e88a-d823-44e0-a003-e4727613212d,TCGA-GN-A4U8,train,data/raw_wsi/a221e88a-d823-44e0-a003-e4727613212d.svs,benign
-db2c37df-7a9a-47fc-a74a-6f4b641415db,TCGA-ER-A19B,train,data/raw_wsi/db2c37df-7a9a-47fc-a74a-6f4b641415db.svs,malignant

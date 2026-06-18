@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime
@@ -29,9 +30,14 @@ CAL_DIR = OUT_DIR / "calibration"
 EXPL_DIR = OUT_DIR / "explanation"
 RETR_DIR = OUT_DIR / "retrieval"
 OOD_DIR = OUT_DIR / "ood"
-FEATURE_ROOT = Path("/mnt/d/skin_cancer_project/cache")
-OOD_LABELS_CSV = Path("/mnt/d/skin_cancer_project/datasets/labels/ood_disease_types.csv")
-OOD_IMAGES_DIR = Path("/mnt/d/skin_cancer_project/datasets/cobra_ood/images")
+DATA_ROOT = Path(
+    os.environ.get("SKINSIGHT_DATA_ROOT", "/mnt/d/skin_cancer_project/datasets")
+).expanduser()
+FEATURE_ROOT = Path(
+    os.environ.get("SKINSIGHT_CACHE_ROOT", "/mnt/d/skin_cancer_project/cache")
+).expanduser()
+OOD_LABELS_CSV = DATA_ROOT / "labels" / "ood_disease_types.csv"
+OOD_IMAGES_DIR = DATA_ROOT / "cobra_ood" / "images"
 
 SHORTLIST = [
     "uni_cost_sensitive_strong",

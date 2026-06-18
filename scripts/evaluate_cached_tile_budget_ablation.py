@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -36,7 +37,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_DIR = PROJECT_ROOT / "results" / "phase11_tile_budget_ablation"
 MANIFEST_PATH = PROJECT_ROOT / "results" / "phase0_registry" / "split_manifests" / "test.csv"
 CALIBRATION_PATH = PROJECT_ROOT / "results" / "phase2_safety" / "calibration_registry.json"
-FEATURE_ROOT = Path("/mnt/d/skin_cancer_project/cache")
+FEATURE_ROOT = Path(
+    os.environ.get("SKINSIGHT_CACHE_ROOT", "/mnt/d/skin_cancer_project/cache")
+).expanduser()
 
 LABELS = ["Normal/Benign", "BCC", "SCC", "Melanoma"]
 MELANOMA_INDEX = LABELS.index("Melanoma")

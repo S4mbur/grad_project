@@ -24,7 +24,7 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
-from src.utils.seed import set_global_seed
+from scripts.reproducibility import set_global_seed
 
 
 RESULTS_ROOT = PROJECT_ROOT / "results"

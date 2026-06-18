@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
@@ -426,20 +427,28 @@ def make_tile_budget_curve(gating_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def check_real_feature_benchmark_status() -> Dict[str, object]:
-    d_root = Path("/mnt/d/skin_cancer_project")
+    data_root = Path(
+        os.environ.get("SKINSIGHT_DATA_ROOT", "/mnt/d/skin_cancer_project/datasets")
+    ).expanduser()
+    models_root = Path(
+        os.environ.get("SKINSIGHT_MODELS_ROOT", "/mnt/d/skin_cancer_project/models")
+    ).expanduser()
+    cache_root = Path(
+        os.environ.get("SKINSIGHT_CACHE_ROOT", "/mnt/d/skin_cancer_project/cache")
+    ).expanduser()
     checks = {
-        "d_root_exists": d_root.exists(),
-        "d_root_has_entries": d_root.exists() and any(d_root.iterdir()),
-        "uni_weights": (d_root / "models/pathology/uni/pytorch_model.bin").exists(),
-        "conch_weights": (d_root / "models/pathology/conch/pytorch_model.bin").exists(),
-        "phikon_weights_dir": (d_root / "models/pathology/phikon").exists(),
-        "tcga_skcm_dir": (d_root / "datasets/tcga_skcm").exists(),
-        "feature_dir": (d_root / "features").exists(),
+        "data_root_exists": data_root.exists(),
+        "data_root_has_entries": data_root.exists() and any(data_root.iterdir()),
+        "uni_weights": (models_root / "pathology/uni/pytorch_model.bin").exists(),
+        "conch_weights": (models_root / "pathology/conch/pytorch_model.bin").exists(),
+        "phikon_weights_dir": (models_root / "pathology/phikon").exists(),
+        "tcga_skcm_dir": (data_root / "tcga_skcm").exists(),
+        "feature_dir": cache_root.exists(),
     }
     checks["can_run_real_wsi_feature_benchmark"] = all(
         [
-            checks["d_root_exists"],
-            checks["d_root_has_entries"],
+            checks["data_root_exists"],
+            checks["data_root_has_entries"],
             checks["uni_weights"],
             checks["conch_weights"],
             checks["phikon_weights_dir"],

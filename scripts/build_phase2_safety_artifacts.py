@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -16,8 +17,18 @@ from app import server
 
 PHASE2_DIR = PROJECT_DIR / 'results' / 'phase2_safety'
 PHASE2_DIR.mkdir(parents=True, exist_ok=True)
-MULTICLASS_MANIFEST = PROJECT_DIR / 'data' / 'manifests' / 'multiclass_slide_manifest.csv'
-FEATURE_ROOT = Path('/mnt/d/skin_cancer_project/cache')
+DATA_ROOT = Path(
+    os.environ.get('SKINSIGHT_DATA_ROOT', '/mnt/d/skin_cancer_project/datasets')
+).expanduser()
+FEATURE_ROOT = Path(
+    os.environ.get('SKINSIGHT_CACHE_ROOT', '/mnt/d/skin_cancer_project/cache')
+).expanduser()
+MULTICLASS_MANIFEST = Path(
+    os.environ.get(
+        'SKINSIGHT_MULTICLASS_MANIFEST',
+        str(DATA_ROOT / 'manifests' / 'multiclass_slide_manifest.csv'),
+    )
+).expanduser()
 LABEL_TO_ID = {name: idx for idx, name in server.CLASS_NAMES.items()}
 
 

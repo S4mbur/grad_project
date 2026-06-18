@@ -1256,14 +1256,14 @@ public class AnalysisService
         var envRoot = Environment.GetEnvironmentVariable("SKINSIGHT_PROJECT_ROOT");
         if (!string.IsNullOrWhiteSpace(envRoot) &&
             Directory.Exists(Path.Combine(envRoot, "app_desktop")) &&
-            Directory.Exists(Path.Combine(envRoot, "app_dotnet")))
+            Directory.Exists(Path.Combine(envRoot, "app")))
             return Path.GetFullPath(envRoot);
 
         var dir = new DirectoryInfo(Path.GetFullPath(startPath));
         while (dir != null)
         {
             if (Directory.Exists(Path.Combine(dir.FullName, "app_desktop")) &&
-                Directory.Exists(Path.Combine(dir.FullName, "app_dotnet")))
+                Directory.Exists(Path.Combine(dir.FullName, "app")))
                 return dir.FullName;
             dir = dir.Parent;
         }

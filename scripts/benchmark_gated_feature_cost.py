@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import random
 import time
 from pathlib import Path
@@ -26,10 +27,13 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from app import server  # noqa: E402
 
 
+DATA_ROOT = Path(
+    os.environ.get("SKINSIGHT_DATA_ROOT", "/mnt/d/skin_cancer_project/datasets")
+).expanduser()
 DEFAULT_SLIDE_ROOTS = [
-    Path("/mnt/d/skin_cancer_project/datasets/tcga_skcm"),
-    Path("/mnt/d/skin_cancer_project/datasets/cobra_ood/images"),
-    Path("/mnt/d/skin_cancer_project/datasets/cobra_bcc"),
+    DATA_ROOT / "tcga_skcm",
+    DATA_ROOT / "cobra_ood" / "images",
+    DATA_ROOT / "cobra_bcc",
 ]
 
 
@@ -246,7 +250,9 @@ def main() -> None:
     slides = args.slides if args.slides else discover_slides(args.max_slides)
     slides = [Path(p) for p in slides if Path(p).exists()]
     if not slides:
-        raise FileNotFoundError("No WSI slides found. Pass --slides or mount /mnt/d/skin_cancer_project.")
+        raise FileNotFoundError(
+            "No WSI slides found. Pass --slides or set SKINSIGHT_DATA_ROOT."
+        )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     rows: List[Dict[str, object]] = []

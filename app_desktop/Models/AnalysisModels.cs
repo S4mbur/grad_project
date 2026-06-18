@@ -13,8 +13,8 @@ public class SkinSightConfig
     public int DziOverlap { get; set; } = 1;
     public int DziQuality { get; set; } = 75;
     public int SlideCacheSize { get; set; } = 4;
-    public string OnnxModelPath { get; set; } = "../data/mil_results/best_model.onnx";
-    public string OnnxEncoderPath { get; set; } = "../data/mil_results/encoder.onnx";
+    public string OnnxModelPath { get; set; } = "../results/deployment/best_model.onnx";
+    public string OnnxEncoderPath { get; set; } = "../results/deployment/encoder.onnx";
 }
 
 public static class ClassInfo

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Dict, List, Sequence
@@ -28,16 +29,19 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from app import server  # noqa: E402
-from src.utils.seed import set_global_seed  # noqa: E402
+from scripts.reproducibility import set_global_seed  # noqa: E402
 
 
 PHASE0_DIR = PROJECT_ROOT / "results" / "phase0_registry"
 OUTPUT_DIR = PROJECT_ROOT / "results" / "phase10_ood_posthoc"
 
+CACHE_ROOT = Path(
+    os.environ.get("SKINSIGHT_CACHE_ROOT", "/mnt/d/skin_cancer_project/cache")
+).expanduser()
 MODEL_FEATURE_DIRS = {
-    "uni_cost_sensitive_strong": Path("/mnt/d/skin_cancer_project/cache/features_4class_uni"),
-    "phikon_cost_sensitive_strong": Path("/mnt/d/skin_cancer_project/cache/features_4class_phikon"),
-    "conch_cost_sensitive_strong": Path("/mnt/d/skin_cancer_project/cache/features_4class_conch"),
+    "uni_cost_sensitive_strong": CACHE_ROOT / "features_4class_uni",
+    "phikon_cost_sensitive_strong": CACHE_ROOT / "features_4class_phikon",
+    "conch_cost_sensitive_strong": CACHE_ROOT / "features_4class_conch",
 }
 
 

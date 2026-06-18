@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import random
 import sys
 from collections import Counter, defaultdict
@@ -28,13 +29,13 @@ Image.MAX_IMAGE_PIXELS = None
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-if str(PROJECT_ROOT / "src") not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT / "src"))
-
 from melanoma_metrics import aggregate_error_bank  # noqa: E402
 
 
 def resolve_data_root() -> Path:
+    configured = os.environ.get("SKINSIGHT_DATA_ROOT")
+    if configured:
+        return Path(configured).expanduser()
     candidates = [
         Path("/mnt/d/skin_cancer_project/datasets"),
         Path("D:/skin_cancer_project/datasets"),
@@ -185,11 +186,7 @@ def slide_probe(path: Path) -> SlideProbe:
 def build_source_rows() -> list[dict]:
     rows: list[dict] = []
 
-    label_roots = [
-        LABEL_ROOT,
-        PROJECT_ROOT / "data" / "cobra",
-        PROJECT_ROOT / "data" / "cobra_fresh",
-    ]
+    label_roots = [LABEL_ROOT]
     bcc_csv = first_existing_path((root / "bcc_bcc.csv" for root in label_roots), "BCC label CSV")
     ood_csv = first_existing_path(
         list(root / "ood_disease_types.csv" for root in label_roots)

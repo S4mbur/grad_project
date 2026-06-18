@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -52,7 +53,9 @@ from app import similarity_metrics as smet  # noqa: E402
 PHASE4_DIR = PROJECT_DIR / "results" / "phase4_retrieval"
 DEFAULT_REGISTRY = PHASE4_DIR / "retrieval_registry.json"
 DEFAULT_OUTPUT = PHASE4_DIR / "attention_covariances.npz"
-FEATURE_ROOT = Path("/mnt/d/skin_cancer_project/cache")
+FEATURE_ROOT = Path(
+    os.environ.get("SKINSIGHT_CACHE_ROOT", "/mnt/d/skin_cancer_project/cache")
+).expanduser()
 
 
 def parse_args() -> argparse.Namespace:

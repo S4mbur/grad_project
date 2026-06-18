@@ -1,6 +1,0 @@
-slide_id,patient_id,split,local_path
-3f66b550-8e59-4d6b-8725-e04603d1d09f,TCGA-D3-A3MU,test,data/raw_wsi/3f66b550-8e59-4d6b-8725-e04603d1d09f.svs
-b4bb392c-91aa-4c47-b1f4-e1d5503aa0de,TCGA-ER-A2ND,test,data/raw_wsi/b4bb392c-91aa-4c47-b1f4-e1d5503aa0de.svs
-1c9e5b03-bec4-40e5-80c1-e74d669d6b2d,TCGA-EE-A2MR,train,data/raw_wsi/1c9e5b03-bec4-40e5-80c1-e74d669d6b2d.svs
-db2c37df-7a9a-47fc-a74a-6f4b641415db,TCGA-ER-A19B,train,data/raw_wsi/db2c37df-7a9a-47fc-a74a-6f4b641415db.svs
-93c4465c-5492-4507-8635-ede530c18ab6,TCGA-ER-A2NC,train,data/raw_wsi/93c4465c-5492-4507-8635-ede530c18ab6.svs

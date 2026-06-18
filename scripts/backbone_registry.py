@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 
+import os
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 from torchvision import models, transforms
 
+MODELS_ROOT = Path(
+    os.environ.get("SKINSIGHT_MODELS_ROOT", "/mnt/d/skin_cancer_project/models")
+).expanduser()
+
 MODEL_CONFIGS = [
     {
         "name": "ResNet18",
         "type": "torchvision",
-        "weights_path": "/mnt/d/skin_cancer_project/models/torchvision/resnet18.pth",
+        "weights_path": str(MODELS_ROOT / "torchvision" / "resnet18.pth"),
         "feat_dim": 512,
         "loader": "resnet18",
         "feat_dir": "features_4class_resnet18",
@@ -19,7 +24,7 @@ MODEL_CONFIGS = [
     {
         "name": "ResNet50",
         "type": "torchvision",
-        "weights_path": "/mnt/d/skin_cancer_project/models/torchvision/resnet50.pth",
+        "weights_path": str(MODELS_ROOT / "torchvision" / "resnet50.pth"),
         "feat_dim": 2048,
         "loader": "resnet50",
         "feat_dir": "features_4class_resnet50",
@@ -28,7 +33,7 @@ MODEL_CONFIGS = [
     {
         "name": "ConvNeXt-Small",
         "type": "torchvision",
-        "weights_path": "/mnt/d/skin_cancer_project/models/torchvision/convnext_small.pth",
+        "weights_path": str(MODELS_ROOT / "torchvision" / "convnext_small.pth"),
         "feat_dim": 768,
         "loader": "convnext_small",
         "feat_dir": "features_4class_convnext_small",
@@ -37,7 +42,7 @@ MODEL_CONFIGS = [
     {
         "name": "ConvNeXt-Base",
         "type": "torchvision",
-        "weights_path": "/mnt/d/skin_cancer_project/models/torchvision/convnext_base.pth",
+        "weights_path": str(MODELS_ROOT / "torchvision" / "convnext_base.pth"),
         "feat_dim": 1024,
         "loader": "convnext_base",
         "feat_dir": "features_4class_convnext_base",
@@ -46,7 +51,7 @@ MODEL_CONFIGS = [
     {
         "name": "DINOv2-base",
         "type": "dinov2",
-        "weights_path": "/mnt/d/skin_cancer_project/models/vision/dinov2-base",
+        "weights_path": str(MODELS_ROOT / "vision" / "dinov2-base"),
         "feat_dim": 768,
         "loader": "dinov2",
         "feat_dir": "features_4class_dinov2_base",
@@ -55,7 +60,7 @@ MODEL_CONFIGS = [
     {
         "name": "Phikon",
         "type": "phikon",
-        "weights_path": "/mnt/d/skin_cancer_project/models/pathology/phikon",
+        "weights_path": str(MODELS_ROOT / "pathology" / "phikon"),
         "feat_dim": 768,
         "loader": "phikon",
         "feat_dir": "features_4class_phikon",
@@ -64,7 +69,7 @@ MODEL_CONFIGS = [
     {
         "name": "UNI",
         "type": "uni",
-        "weights_path": "/mnt/d/skin_cancer_project/models/pathology/uni/pytorch_model.bin",
+        "weights_path": str(MODELS_ROOT / "pathology" / "uni" / "pytorch_model.bin"),
         "feat_dim": 1024,
         "loader": "uni",
         "feat_dir": "features_4class_uni",
@@ -73,7 +78,7 @@ MODEL_CONFIGS = [
     {
         "name": "CONCH",
         "type": "conch",
-        "weights_path": "/mnt/d/skin_cancer_project/models/pathology/conch/pytorch_model.bin",
+        "weights_path": str(MODELS_ROOT / "pathology" / "conch" / "pytorch_model.bin"),
         "feat_dim": 512,
         "loader": "conch",
         "feat_dir": "features_4class_conch",

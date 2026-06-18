@@ -54,7 +54,6 @@ PHASE0_THRESHOLD_PATH = PHASE0_DIR / "threshold_registry.json"
 PHASE0_EXPERIMENT_PATH = PHASE0_DIR / "experiment_registry.json"
 
 sys.path.insert(0, str(PROJECT_DIR))
-sys.path.insert(0, str(PROJECT_DIR / "src"))
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -133,8 +132,12 @@ N_CLASSES = 4
 # ---------------------------------------------------------------------------
 # Model Registry â€” best version of each model
 # ---------------------------------------------------------------------------
-MODELS_DIR = Path("/mnt/d/skin_cancer_project/models")
-RESULTS_BASE = PROJECT_DIR / "results"
+MODELS_DIR = Path(
+    os.environ.get("SKINSIGHT_MODELS_ROOT", "/mnt/d/skin_cancer_project/models")
+).expanduser()
+RESULTS_BASE = Path(
+    os.environ.get("SKINSIGHT_RESULTS_ROOT", str(PROJECT_DIR / "results"))
+).expanduser()
 
 
 def _windows_style_from_wsl_path(path_str: str):

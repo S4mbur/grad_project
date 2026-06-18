@@ -135,9 +135,15 @@ EXPERIMENTS = [
 # ============================================================
 class Config:
     project_root = Path(__file__).resolve().parents[1]
-    data_root = Path("/mnt/d/skin_cancer_project/datasets")
-    base_output = project_root / "results"
-    cache_root = Path("/mnt/d/skin_cancer_project/cache")
+    data_root = Path(
+        os.environ.get("SKINSIGHT_DATA_ROOT", "/mnt/d/skin_cancer_project/datasets")
+    ).expanduser()
+    base_output = Path(
+        os.environ.get("SKINSIGHT_RESULTS_ROOT", str(project_root / "results"))
+    ).expanduser()
+    cache_root = Path(
+        os.environ.get("SKINSIGHT_CACHE_ROOT", "/mnt/d/skin_cancer_project/cache")
+    ).expanduser()
     tile_dir = cache_root / "tiles_4class"
     base_feature_dir = cache_root
 
@@ -203,11 +209,7 @@ def create_unified_labels(cfg):
     logger = logging.getLogger(__name__)
     entries = []
 
-    label_roots = [
-        cfg.data_root / "labels",
-        cfg.project_root / "data" / "cobra",
-        cfg.project_root / "data" / "cobra_fresh",
-    ]
+    label_roots = [cfg.data_root / "labels"]
     bcc_csv = _first_existing_path([
         root / "bcc_bcc.csv" for root in label_roots
     ], "BCC label CSV")
